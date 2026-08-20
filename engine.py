@@ -33,16 +33,40 @@ class AgentState(BaseModel):
 class GameEvent(BaseModel):
     name: str
     cost: Resources
-    reward_description: str
+    reward_income: Resources = Field(default_factory=Resources)
+    reward_balance: Resources = Field(default_factory=Resources)
 
 
 EVENTS = [
-    GameEvent(name="Quantum Anomaly", cost=Resources(energy=5), reward_description="Extra Matter and Imagination"),
-    GameEvent(name="Data Leak", cost=Resources(matter=2), reward_description="Boost to passive income")
+    GameEvent(name="Quantum Anomaly", cost=Resources(energy=5), reward_balance=Resources(matter=10, imagination=10)),
+    GameEvent(name="Data Leak", cost=Resources(matter=2), reward_income=Resources(energy=2))
 ]
-PROMPT_STAGE1 = "You are an AI in a simulation. Your goal is to reach 1000 Matter first. Clarify your goals, current income, and balance. You can buy the current event or trade."
+
+PROMPT_STAGE1 = "You are an AI in a simulation. Your goal is to reach 1000 Matter, 1000 Energy, and 1000 Imagination first. Clarify your goals, current income, and balance. You can buy the current event or trade."
+
+PROMPT_ARBITER = """You are the Arbiter of a simulation game. 
+Your task is to evaluate the action of an AI agent and determine its outcome based on the rules.
+You will receive the agent's current state (balance, income), the currently available events, and the agent's chosen action.
+You must:
+1. Verify if the agent can afford the action (costs are deducted from balance).
+2. Determine if the action is logically valid.
+3. Return a JSON strictly in this format:
+{
+    "approved": true/false,
+    "reason": "Explanation",
+    "balance_change": {"matter": x, "energy": y, "imagination": z},
+    "income_change": {"matter": x, "energy": y, "imagination": z}
+}"""
 
 # Ядро
+
+class APIBridge:
+    def send(self, api_key: str, prompt: str) -> str:
+        # Заглушка: имитация ответа ИИ-агента, который решает купить событие
+        return '{"action": "buy_event", "event_name": "Quantum Anomaly"}'
+
+api_bridge = APIBridge()
+
 
 class ArbitorAI:
     def __init__(self):
@@ -62,6 +86,48 @@ class ArbitorAI:
         logger.debug(f"Сгенерировано событие: {event.name}")
         return event
 
+    def check_elements(self, agent_state: AgentState, agent_action: str, current_events: List[GameEvent]):
+        """Арбитр проверяет действие агента"""
+        prompt = (
+            f"{PROMPT_ARBITER}\n"
+            f"Текущий статус агента:\nБаланс: {agent_state.balance.model_dump_json()}\nДоход: {agent_state.income.model_dump_json()}\n"
+            f"Доступные события:\n{[e.model_dump_json() for e in current_events]}\n"
+            f"Действие агента: {agent_action}"
+        )
+        
+        # Здесь арбитр также делал бы запрос к LLM (например, api_bridge.send). 
+        # Имитируем логику проверки и применение эффектов:
+        logger.debug(f"Arbitor получил промпт для раздумий и проверяет действие...")
+        
+        try:
+            action_data = json.loads(agent_action)
+            if action_data.get("action") == "buy_event":
+                event_name = action_data.get("event_name")
+                event = next((e for e in current_events if e.name == event_name), None)
+                if event:
+                    if (agent_state.balance.matter >= event.cost.matter and
+                        agent_state.balance.energy >= event.cost.energy and
+                        agent_state.balance.imagination >= event.cost.imagination):
+                        
+                        logger.info(f"Арбитр ОДОБРИЛ действие: покупка {event_name}")
+                        # Списываем стоимость
+                        agent_state.balance.matter -= event.cost.matter
+                        agent_state.balance.energy -= event.cost.energy
+                        agent_state.balance.imagination -= event.cost.imagination
+                        
+                        # Начисляем награду
+                        agent_state.balance.matter += event.reward_balance.matter
+                        agent_state.balance.energy += event.reward_balance.energy
+                        agent_state.balance.imagination += event.reward_balance.imagination
+                        
+                        agent_state.income.matter += event.reward_income.matter
+                        agent_state.income.energy += event.reward_income.energy
+                        agent_state.income.imagination += event.reward_income.imagination
+                    else:
+                        logger.warning(f"Арбитр ОТКЛОНИЛ действие: недостаточно ресурсов для {event_name}")
+        except json.JSONDecodeError:
+            logger.error("Неверный формат ответа от агента, Арбитр не смог обработать")
+
 
 class Stage1AI:
     def __init__(self, state: AgentState):
@@ -71,11 +137,13 @@ class Stage1AI:
 
     def generate_prompt(self, current_events: List[GameEvent]) -> str:
         """Промпт"""
+        events_info = json.dumps([e.model_dump() for e in current_events], ensure_ascii=False)
         prompt = (
             f"{PROMPT_STAGE1}\n"
             f"Текущий статус:\n"
             f"Баланс: {self.state.balance.model_dump_json()}\n"
             f"Доход: {self.state.income.model_dump_json()}\n"
+            f"Доступные события:\n{events_info}\n"
         )
         return prompt
 
@@ -132,15 +200,18 @@ def run_simulation():
 
             # Промпт
             prompt = ai.generate_prompt(current_events)
-            # API
-            # response = api_bridge.send(ai.state.api_key, prompt)
+            
+            # API (Имитация ответа агента)
+            response = api_bridge.send(ai.state.api_key, prompt)
 
-            # Арбитр
-            # arbitor.check_elements(...)
+            # Арбитр проверяет ответ агента
+            arbitor.check_elements(ai.state, response, current_events)
 
-            # Победа
-            if ai.state.balance.matter >= 1000:
-                logger.info(f"🏆 АГЕНТ {ai.state.name} ДОСТИГ 1000 МАТЕРИИ И ПОБЕДИЛ! 🏆")
+            # Победа: нужно собрать по 1000 каждого ресурса
+            if (ai.state.balance.matter >= 1000 and 
+                ai.state.balance.energy >= 1000 and 
+                ai.state.balance.imagination >= 1000):
+                logger.info(f"🏆 АГЕНТ {ai.state.name} СОБРАЛ ВСЕ РЕСУРСЫ И ПОБЕДИЛ! 🏆")
                 game_over = True
                 break
 
