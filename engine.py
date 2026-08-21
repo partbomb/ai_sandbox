@@ -3,6 +3,8 @@ import logging
 import time
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
 
 # Логирование
 logger = logging.getLogger("GameEngine")
@@ -62,8 +64,33 @@ You must:
 
 class APIBridge:
     def send(self, api_key: str, prompt: str) -> str:
-        # Заглушка: имитация ответа ИИ-агента, который решает купить событие
-        return '{"action": "buy_event", "event_name": "Quantum Anomaly"}'
+        if not api_key or api_key == "ВСТАВЬТЕ_ВАШ_API_КЛЮЧ_СЮДА" or api_key.startswith("sk-"):
+            # Если ключ не указан, используем старую заглушку
+            event_name = "Quantum Anomaly"
+            try:
+                if "Доступные события:\n[" in prompt:
+                    events_str = prompt.split("Доступные события:\n")[1].split("\n")[0]
+                    events = json.loads(events_str)
+                    if events:
+                        event_name = events[0].get("name", event_name)
+            except Exception:
+                pass
+            return json.dumps({"action": "buy_event", "event_name": event_name})
+            
+        try:
+            logger.debug("Отправка реального запроса в Gemini API...")
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model='gemini-3.6-flash',
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
+            return response.text
+        except Exception as e:
+            logger.error(f"Ошибка вызова API: {e}")
+            return json.dumps({"action": "pass"})
 
 api_bridge = APIBridge()
 
@@ -216,11 +243,11 @@ def run_simulation():
                 break
 
         # Ограничитель
-        if time_tick >= 50:
+        if time_tick >= 200:
             logger.warning("Тестовый лимит ходов достигнут. Остановка симуляции.")
             break
             
-        time.sleep(1)
+        time.sleep(0.5)
 
 if __name__ == "__main__":
     run_simulation()
