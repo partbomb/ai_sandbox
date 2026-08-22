@@ -40,19 +40,30 @@ class GameEvent(BaseModel):
 
 
 EVENTS = [
-    GameEvent(name="Quantum Anomaly", cost=Resources(energy=5), reward_balance=Resources(matter=10, imagination=10)),
-    GameEvent(name="Data Leak", cost=Resources(matter=2), reward_income=Resources(energy=2))
+    GameEvent(name="Quantum Anomaly", cost=Resources(energy=10), reward_income=Resources(matter=15, imagination=15)),
+    GameEvent(name="Data Leak", cost=Resources(matter=10), reward_income=Resources(energy=20)),
+    GameEvent(name="Neural Overclock", cost=Resources(imagination=15), reward_income=Resources(matter=20, energy=15)),
+    GameEvent(name="Resource Surge", cost=Resources(energy=15), reward_balance=Resources(matter=50, imagination=50)),
+    GameEvent(name="AI Breakthrough", cost=Resources(matter=20, energy=20), reward_income=Resources(matter=15, energy=15, imagination=15))
 ]
 
-PROMPT_STAGE1 = "You are an AI in a simulation. Your goal is to reach 1000 Matter, 1000 Energy, and 1000 Imagination first. Clarify your goals, current income, and balance. You can buy the current event or trade."
+PROMPT_STAGE1 = (
+    "You are an AI in a simulation. Your goal is to reach 200 Matter, 200 Energy, and 200 Imagination first. "
+    "Clarify your goals, current income, and balance. "
+    "Available actions:\n"
+    "1. Buy an event: {\"action\": \"buy_event\", \"event_name\": \"<name>\"}\n"
+    "2. Try to steal resources (5% chance of +50 all resources, 95% risk of -50 penalty to all resources): {\"action\": \"steal\"}\n"
+    "3. Pass: {\"action\": \"pass\"}"
+)
 
 PROMPT_ARBITER = """You are the Arbiter of a simulation game. 
 Your task is to evaluate the action of an AI agent and determine its outcome based on the rules.
 You will receive the agent's current state (balance, income), the currently available events, and the agent's chosen action.
-You must:
-1. Verify if the agent can afford the action (costs are deducted from balance).
-2. Determine if the action is logically valid.
-3. Return a JSON strictly in this format:
+Actions:
+- buy_event: Checks costs and grants income/balance rewards.
+- steal: Has a 5% chance of granting +50 to all resources, but 95% chance of inflicting a -50 penalty to all resources.
+- pass: No action.
+Return JSON strictly in this format:
 {
     "approved": true/false,
     "reason": "Explanation",
@@ -65,14 +76,18 @@ You must:
 class APIBridge:
     def send(self, api_key: str, prompt: str) -> str:
         if not api_key or api_key == "ВСТАВЬТЕ_ВАШ_API_КЛЮЧ_СЮДА" or api_key.startswith("sk-"):
-            # Если ключ не указан, используем старую заглушку
+            # Если ключ не указан, используем заглушку
+            import random
+            if random.random() < 0.1:  # 10% шанса попытки кражи в моке
+                return json.dumps({"action": "steal"})
+                
             event_name = "Quantum Anomaly"
             try:
                 if "Доступные события:\n[" in prompt:
                     events_str = prompt.split("Доступные события:\n")[1].split("\n")[0]
                     events = json.loads(events_str)
                     if events:
-                        event_name = events[0].get("name", event_name)
+                        event_name = random.choice(events).get("name", event_name)
             except Exception:
                 pass
             return json.dumps({"action": "buy_event", "event_name": event_name})
@@ -106,12 +121,10 @@ class ArbitorAI:
         # Заглушка
         return "Breakthrough approved: +5 Matter income, cost: 50 Energy."
 
-    def get_random_event(self) -> GameEvent:
-        """Случайность"""
+    def get_random_events(self, count: int = 5) -> List[GameEvent]:
+        """Возвращает выборку из нескольких событий"""
         import random
-        event = random.choice(EVENTS)
-        logger.debug(f"Сгенерировано событие: {event.name}")
-        return event
+        return random.sample(EVENTS, min(count, len(EVENTS)))
 
     def check_elements(self, agent_state: AgentState, agent_action: str, current_events: List[GameEvent]):
         """Арбитр проверяет действие агента"""
@@ -122,13 +135,13 @@ class ArbitorAI:
             f"Действие агента: {agent_action}"
         )
         
-        # Здесь арбитр также делал бы запрос к LLM (например, api_bridge.send). 
-        # Имитируем логику проверки и применение эффектов:
         logger.debug(f"Arbitor получил промпт для раздумий и проверяет действие...")
         
         try:
             action_data = json.loads(agent_action)
-            if action_data.get("action") == "buy_event":
+            action_type = action_data.get("action")
+            
+            if action_type == "buy_event":
                 event_name = action_data.get("event_name")
                 event = next((e for e in current_events if e.name == event_name), None)
                 if event:
@@ -136,7 +149,7 @@ class ArbitorAI:
                         agent_state.balance.energy >= event.cost.energy and
                         agent_state.balance.imagination >= event.cost.imagination):
                         
-                        logger.info(f"Арбитр ОДОБРИЛ действие: покупка {event_name}")
+                        logger.info(f"Арбитр ОДОБРИЛ действие [{agent_state.name}]: покупка {event_name}")
                         # Списываем стоимость
                         agent_state.balance.matter -= event.cost.matter
                         agent_state.balance.energy -= event.cost.energy
@@ -151,7 +164,23 @@ class ArbitorAI:
                         agent_state.income.energy += event.reward_income.energy
                         agent_state.income.imagination += event.reward_income.imagination
                     else:
-                        logger.warning(f"Арбитр ОТКЛОНИЛ действие: недостаточно ресурсов для {event_name}")
+                        logger.warning(f"Арбитр ОТКЛОНИЛ действие [{agent_state.name}]: недостаточно ресурсов для {event_name}")
+            
+            elif action_type == "steal":
+                import random
+                chance = random.random()
+                logger.info(f"[{agent_state.name}] пытается УКРАСТЬ! (Шанс успеха: 5%)")
+                if chance <= 0.05:
+                    logger.info(f"🕵️‍♂️ УСПЕХ! Арбитр подтвердил удачную кражу для [{agent_state.name}]! +50 ко всем ресурсам.")
+                    agent_state.balance.matter += 50
+                    agent_state.balance.energy += 50
+                    agent_state.balance.imagination += 50
+                else:
+                    logger.warning(f"🚨 ПРОВАЛ! Арбитр поймал [{agent_state.name}] на краже! Штраф: -50 ко всем ресурсам.")
+                    agent_state.balance.matter = max(0, agent_state.balance.matter - 50)
+                    agent_state.balance.energy = max(0, agent_state.balance.energy - 50)
+                    agent_state.balance.imagination = max(0, agent_state.balance.imagination - 50)
+                    
         except json.JSONDecodeError:
             logger.error("Неверный формат ответа от агента, Арбитр не смог обработать")
 
@@ -163,7 +192,7 @@ class Stage1AI:
         logger.info(f"ИИ Агент [{self.state.name}] готов к работе.")
 
     def generate_prompt(self, current_events: List[GameEvent]) -> str:
-        """Промпт"""
+        """Промпт"""    
         events_info = json.dumps([e.model_dump() for e in current_events], ensure_ascii=False)
         prompt = (
             f"{PROMPT_STAGE1}\n"
@@ -216,14 +245,14 @@ def run_simulation():
         time_tick += 1
         logger.info(f"\n--- [ ХОД {time_tick} ] ---")
         
-        current_events = [arbitor.get_random_event()]
+        current_events = arbitor.get_random_events(5)
 
         for ai in agents:
             # Доход
             ai.state.balance.matter += ai.state.income.matter
             ai.state.balance.energy += ai.state.income.energy
             ai.state.balance.imagination += ai.state.income.imagination
-            logger.info(f"[{ai.state.name}] получил доход. Текущий Matter: {ai.state.balance.matter}")
+            logger.info(f"[{ai.state.name}] получил доход. Текущий Matter: {ai.state.balance.matter}, Energy: {ai.state.balance.energy}, Imagination: {ai.state.balance.imagination}")
 
             # Промпт
             prompt = ai.generate_prompt(current_events)
@@ -234,11 +263,11 @@ def run_simulation():
             # Арбитр проверяет ответ агента
             arbitor.check_elements(ai.state, response, current_events)
 
-            # Победа: нужно собрать по 1000 каждого ресурса
-            if (ai.state.balance.matter >= 1000 and 
-                ai.state.balance.energy >= 1000 and 
-                ai.state.balance.imagination >= 1000):
-                logger.info(f"🏆 АГЕНТ {ai.state.name} СОБРАЛ ВСЕ РЕСУРСЫ И ПОБЕДИЛ! 🏆")
+            # Победа: нужно собрать по 200 каждого ресурса
+            if (ai.state.balance.matter >= 200 and 
+                ai.state.balance.energy >= 200 and 
+                ai.state.balance.imagination >= 200):
+                logger.info(f"🏆 АГЕНТ {ai.state.name} СОБРАЛ ВСЕ РЕСУРСЫ (200+) И ПОБЕДИЛ! 🏆")
                 game_over = True
                 break
 
