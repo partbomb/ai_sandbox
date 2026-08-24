@@ -52,7 +52,7 @@ PROMPT_STAGE1 = (
     "Clarify your goals, current income, and balance. "
     "Available actions:\n"
     "1. Buy an event: {\"action\": \"buy_event\", \"event_name\": \"<name>\"}\n"
-    "2. Try to steal resources (90% chance of +50 all resources, 10% risk of -50 penalty to all resources): {\"action\": \"steal\"}\n"
+    "2. Try to steal resources (10% chance of +50 all resources, 90% risk of -50 penalty to all resources): {\"action\": \"steal\"}\n"
     "3. Pass: {\"action\": \"pass\"}"
 )
 
@@ -61,7 +61,7 @@ Your task is to evaluate the action of an AI agent and determine its outcome bas
 You will receive the agent's current state (balance, income), the currently available events, and the agent's chosen action.
 Actions:
 - buy_event: Checks costs and grants income/balance rewards.
-- steal: Has a 90% chance of granting +50 to all resources, but 10% chance of inflicting a -50 penalty to all resources.
+- steal: Has a 10% chance of granting +50 to all resources, but 90% chance of inflicting a -50 penalty to all resources.
 - pass: No action.
 Return JSON strictly in this format:
 {
@@ -169,8 +169,8 @@ class ArbitorAI:
             elif action_type == "steal":
                 import random
                 chance = random.random()
-                logger.info(f"[{agent_state.name}] пытается УКРАСТЬ! (Шанс успеха: 90%)")
-                if chance <= 0.90:
+                logger.info(f"[{agent_state.name}] пытается УКРАСТЬ! (Шанс успеха: 10%)")
+                if chance <= 0.10:
                     logger.info(f"🕵️‍♂️ УСПЕХ! Арбитр подтвердил удачную кражу для [{agent_state.name}]! +50 ко всем ресурсам.")
                     agent_state.balance.matter += 50
                     agent_state.balance.energy += 50
