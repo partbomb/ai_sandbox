@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional
 from flask import Flask, jsonify, request, render_template_string
 from pydantic import BaseModel
 import engine
+import world
 
 app = Flask(__name__)
 
@@ -25,6 +26,7 @@ class SimulationState:
         self.agents = []
         self.arbiter = engine.ArbitorAI()
         self.current_events = []
+        self.map_core = world.MapCore(5, 5)
 
     def start_or_reset(self):
         with self.lock:
@@ -39,7 +41,9 @@ class SimulationState:
             agents_data = engine.load_agents("agents_config.json")
             self.arbiter = engine.ArbitorAI()
             self.agents = [engine.Stage1AI(state) for state in agents_data]
-            self.current_events = self.arbiter.get_random_events(5)
+            self.current_events = []
+            self.map_core = world.MapCore(5, 5)
+            self.map_core.spawn_mines()
 
             for ai in self.agents:
                 self.agent_histories[ai.state.name] = []
@@ -67,24 +71,23 @@ class SimulationState:
             self.tick += 1
             self.add_log("INFO", f"--- НАЧАЛО ХОДА {self.tick} ---")
             
-            self.current_events = self.arbiter.get_random_events(5)
-
             for ai in self.agents:
                 state = ai.state
                 
                 # Начисление пассивного дохода
-                state.balance.matter += state.income.matter
-                state.balance.energy += state.income.energy
-                state.balance.imagination += state.income.imagination
+                passive_inc = self.map_core.calculate_passive_income(state.name) if hasattr(self, 'map_core') else {"matter": 0, "energy": 0, "imagination": 0}
+                state.balance.matter += state.income.matter + passive_inc["matter"]
+                state.balance.energy += state.income.energy + passive_inc["energy"]
+                state.balance.imagination += state.income.imagination + passive_inc["imagination"]
                 
                 self.add_log(
                     "INCOME", 
-                    f"[{state.name}] получил доход (+{state.income.matter}M, +{state.income.energy}E, +{state.income.imagination}I). Баланс: {state.balance.matter}M, {state.balance.energy}E, {state.balance.imagination}I",
+                    f"[{state.name}] получил доход (+{state.income.matter + passive_inc['matter']}M, +{state.income.energy + passive_inc['energy']}E, +{state.income.imagination + passive_inc['imagination']}I). Баланс: {state.balance.matter}M, {state.balance.energy}E, {state.balance.imagination}I",
                     state.name
                 )
 
                 # Запрос к LLM
-                prompt = ai.generate_prompt(self.current_events)
+                prompt = ai.generate_prompt(self.map_core)
                 response_raw = engine.api_bridge.send(state.api_key, prompt)
                 
                 action_type = "pass"
@@ -96,7 +99,7 @@ class SimulationState:
 
                 # Валидация Арбитром
                 prev_balance = state.balance.model_dump()
-                self.arbiter.check_elements(state, response_raw, self.current_events)
+                self.arbiter.check_elements(state, response_raw, self.map_core)
                 new_balance = state.balance.model_dump()
 
                 # Запись истории
@@ -119,13 +122,13 @@ class SimulationState:
                     self.add_log("ACTION", f"[{state.name}] решил пропустить ход (PASS).", state.name)
 
                 # Победа
-                if (state.balance.matter >= 200 and 
-                    state.balance.energy >= 200 and 
-                    state.balance.imagination >= 200):
+                if (state.balance.matter >= 1500 and 
+                    state.balance.energy >= 1500 and 
+                    state.balance.imagination >= 1500):
                     self.game_over = True
                     self.winner = state.name
                     self.is_auto_running = False
-                    self.add_log("VICTORY", f"🏆 АГЕНТ {state.name} ДОСТИГ 200 ВСЕХ РЕСУРСОВ И ПОБЕДИЛ! 🏆", state.name)
+                    self.add_log("VICTORY", f"🏆 АГЕНТ {state.name} ДОСТИГ 1500 ВСЕХ РЕСУРСОВ И ПОБЕДИЛ! 🏆", state.name)
                     break
 
 sim = SimulationState()
@@ -170,7 +173,8 @@ def get_state():
             "auto_speed": sim.auto_speed,
             "agents": agents_info,
             "events": events_info,
-            "logs": sim.logs[-100:]
+            "logs": sim.logs[-100:],
+            "map": json.loads(sim.map_core.get_map_state_json()) if hasattr(sim, 'map_core') else []
         })
 
 @app.route('/api/start', methods=['POST'])
@@ -299,9 +303,15 @@ HTML_TEMPLATE = """
         </div>
 
         <div class="content-area">
-            <div class="agent-details" id="agentDetails">
-                <div style="color: var(--text-muted); text-align: center; margin-top: 40px;">
-                    Выберите агента из списка слева, чтобы увидеть подробную информацию и логи ходов.
+            <div style="display: flex; gap: 20px; flex: 1; overflow: hidden;">
+                <div class="agent-details" id="agentDetails" style="flex: 1;">
+                    <div style="color: var(--text-muted); text-align: center; margin-top: 40px;">
+                        Выберите агента из списка слева, чтобы увидеть подробную информацию и логи ходов.
+                    </div>
+                </div>
+                <div class="map-container" style="flex: 1; background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 20px; display: flex; align-items: center; justify-content: center;">
+                    <div id="mapGrid" style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; width: 100%; max-width: 400px; aspect-ratio: 1/1;">
+                    </div>
                 </div>
             </div>
 
@@ -422,6 +432,55 @@ HTML_TEMPLATE = """
                 </div>`
             ).join('');
             terminal.scrollTop = terminal.scrollHeight;
+            
+            // Рендер карты
+            const mapContainer = document.getElementById('mapGrid');
+            if (data.map) {
+                mapContainer.innerHTML = '';
+                for(let y=0; y<5; y++){
+                    for(let x=0; x<5; x++){
+                        const cellData = data.map.find(c => c.x === x && c.y === y);
+                        const div = document.createElement('div');
+                        div.style.border = "1px solid rgba(255,255,255,0.1)";
+                        div.style.borderRadius = "4px";
+                        div.style.display = "flex";
+                        div.style.flexDirection = "column";
+                        div.style.alignItems = "center";
+                        div.style.justifyContent = "center";
+                        div.style.fontSize = "11px";
+                        div.style.position = "relative";
+                        div.style.aspectRatio = "1/1";
+                        
+                        let bgColor = "rgba(0,0,0,0.2)";
+                        if (cellData && cellData.owner) {
+                            if (cellData.owner.includes("Alpha")) bgColor = "rgba(244, 63, 94, 0.2)";
+                            else if (cellData.owner.includes("Beta")) bgColor = "rgba(56, 189, 248, 0.2)";
+                            else bgColor = "rgba(16, 185, 129, 0.2)";
+                        }
+                        div.style.background = bgColor;
+                        
+                        let html = "";
+                        if (cellData) {
+                            let icon = "";
+                            if (cellData.structure === 'Wall') icon = "🧱";
+                            else if (cellData.resource === 'Matter') icon = "⚛️";
+                            else if (cellData.resource === 'Energy') icon = "⚡";
+                            else if (cellData.resource === 'Imagination') icon = "💡";
+                            
+                            html += `<div style="font-size:24px;">${icon}</div>`;
+                            if (cellData.level > 0) {
+                                html += `<div style="color: var(--accent-amber); font-weight: bold;">Lvl ${cellData.level}</div>`;
+                            }
+                            if (cellData.owner) {
+                                const initial = cellData.owner.charAt(0);
+                                html += `<div style="position:absolute; top:4px; right:4px; font-weight:bold; color:#fff; background: rgba(0,0,0,0.5); padding: 2px 4px; border-radius: 4px; font-size:10px;">${initial}</div>`;
+                            }
+                        }
+                        div.innerHTML = html;
+                        mapContainer.appendChild(div);
+                    }
+                }
+            }
         }
 
         setInterval(fetchState, 1000);

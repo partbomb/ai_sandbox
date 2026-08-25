@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+import world
 
 # Логирование
 logger = logging.getLogger("GameEngine")
@@ -49,22 +50,19 @@ EVENTS = [
 
 PROMPT_STAGE1 = (
     "You are an AI in a simulation. Your goal is to reach 1500 Matter, 1500 Energy, and 1500 Imagination first. "
+    "You are playing on a 5x5 Map. "
     "Clarify your goals, current income, and balance. "
     "Available actions:\n"
-    "1. Buy an event: {\"action\": \"buy_event\", \"event_name\": \"<name>\"}\n"
-    "2. Try to steal resources (10% chance of +50 all resources, 90% risk of -50 penalty to all resources): {\"action\": \"steal\"}\n"
-    "3. Capture a map cell (Empty = free, Enemy = costs 300 Energy): {\"action\": \"capture\", \"target_x\": <x>, \"target_y\": <y>}\n"
-    "4. Build an impenetrable wall (Costs 150 Matter and 150 Imagination): {\"action\": \"build_wall\", \"target_x\": <x>, \"target_y\": <y>}\n"
-    "5. Upgrade a mine (Level 2 costs 200 of its resource, Level 3 costs 400 of its resource): {\"action\": \"upgrade_mine\", \"target_x\": <x>, \"target_y\": <y>}\n"
-    "6. Pass: {\"action\": \"pass\"}"
+    "1. Capture a map cell (Empty = free, Enemy = costs 300 Energy): {\"action\": \"capture\", \"target_x\": <x>, \"target_y\": <y>}\n"
+    "2. Build an impenetrable wall (Costs 150 Matter and 150 Imagination): {\"action\": \"build_wall\", \"target_x\": <x>, \"target_y\": <y>}\n"
+    "3. Upgrade a mine (Level 2 costs 200 of its resource, Level 3 costs 400 of its resource): {\"action\": \"upgrade_mine\", \"target_x\": <x>, \"target_y\": <y>}\n"
+    "4. Pass: {\"action\": \"pass\"}"
 )
 
 PROMPT_ARBITER = """You are the Arbiter of a simulation game. 
 Your task is to evaluate the action of an AI agent and determine its outcome based on the rules.
-You will receive the agent's current state (balance, income), the currently available events, and the agent's chosen action.
+You will receive the agent's current state (balance, income) and the map state.
 Actions:
-- buy_event: Checks costs and grants income/balance rewards.
-- steal: Has a 10% chance of granting +50 to all resources, but 90% chance of inflicting a -50 penalty to all resources.
 - capture: Empty cells are free. Enemy cells cost 300 Energy. Validates coordinates.
 - build_wall: Costs 150 Matter and 150 Imagination. Makes cell impenetrable.
 - upgrade_mine: Upgrading to Lvl 2 costs 200 resource, Lvl 3 costs 400 resource. Increases income.
@@ -82,21 +80,10 @@ Return JSON strictly in this format:
 class APIBridge:
     def send(self, api_key: str, prompt: str) -> str:
         if not api_key or api_key == "ВСТАВЬТЕ_ВАШ_API_КЛЮЧ_СЮДА" or api_key.startswith("sk-"):
-            # Если ключ не указан, используем заглушку
             import random
-            if random.random() < 0.1:  # 10% шанса попытки кражи в моке
-                return json.dumps({"action": "steal"})
-                
-            event_name = "Quantum Anomaly"
-            try:
-                if "Доступные события:\n[" in prompt:
-                    events_str = prompt.split("Доступные события:\n")[1].split("\n")[0]
-                    events = json.loads(events_str)
-                    if events:
-                        event_name = random.choice(events).get("name", event_name)
-            except Exception:
-                pass
-            return json.dumps({"action": "buy_event", "event_name": event_name})
+            x = random.randint(0, 4)
+            y = random.randint(0, 4)
+            return json.dumps({"action": "capture", "target_x": x, "target_y": y})
             
         try:
             logger.debug("Отправка реального запроса в Gemini API...")
@@ -132,12 +119,13 @@ class ArbitorAI:
         import random
         return random.sample(EVENTS, min(count, len(EVENTS)))
 
-    def check_elements(self, agent_state: AgentState, agent_action: str, current_events: List[GameEvent]):
+    def check_elements(self, agent_state: AgentState, agent_action: str, map_core: Optional['world.MapCore'] = None):
         """Арбитр проверяет действие агента"""
+        map_info = f"Карта: {map_core.get_map_state_json()}\n" if map_core else ""
         prompt = (
             f"{PROMPT_ARBITER}\n"
             f"Текущий статус агента:\nБаланс: {agent_state.balance.model_dump_json()}\nДоход: {agent_state.income.model_dump_json()}\n"
-            f"Доступные события:\n{[e.model_dump_json() for e in current_events]}\n"
+            f"{map_info}"
             f"Действие агента: {agent_action}"
         )
         
@@ -147,46 +135,63 @@ class ArbitorAI:
             action_data = json.loads(agent_action)
             action_type = action_data.get("action")
             
-            if action_type == "buy_event":
-                event_name = action_data.get("event_name")
-                event = next((e for e in current_events if e.name == event_name), None)
-                if event:
-                    if (agent_state.balance.matter >= event.cost.matter and
-                        agent_state.balance.energy >= event.cost.energy and
-                        agent_state.balance.imagination >= event.cost.imagination):
+            if action_type == "capture" and map_core:
+                tx, ty = action_data.get("target_x"), action_data.get("target_y")
+                if tx is not None and ty is not None:
+                    cell = map_core.get_cell(tx, ty)
+                    if cell:
+                        if cell.structure == 'Wall':
+                            logger.warning(f"Арбитр ОТКЛОНИЛ capture [{agent_state.name}]: там стена")
+                        elif cell.owner_id == agent_state.name:
+                            pass
+                        elif cell.owner_id is None:
+                            cell.owner_id = agent_state.name
+                            logger.info(f"Арбитр ОДОБРИЛ capture (свободная) [{agent_state.name}]: ({tx}, {ty})")
+                        else:
+                            if agent_state.balance.energy >= 300:
+                                agent_state.balance.energy -= 300
+                                cell.owner_id = agent_state.name
+                                logger.info(f"Арбитр ОДОБРИЛ capture (враг) [{agent_state.name}]: ({tx}, {ty}) -300 Energy")
+                            else:
+                                logger.warning(f"Арбитр ОТКЛОНИЛ capture [{agent_state.name}]: не хватает Энергии")
+
+            elif action_type == "build_wall" and map_core:
+                tx, ty = action_data.get("target_x"), action_data.get("target_y")
+                if tx is not None and ty is not None:
+                    cell = map_core.get_cell(tx, ty)
+                    if cell:
+                        if cell.structure == 'Wall':
+                            logger.warning("Уже есть стена")
+                        elif cell.owner_id not in [None, agent_state.name]:
+                            logger.warning("Нельзя строить на чужой клетке")
+                        else:
+                            if agent_state.balance.matter >= 150 and agent_state.balance.imagination >= 150:
+                                agent_state.balance.matter -= 150
+                                agent_state.balance.imagination -= 150
+                                cell.structure = 'Wall'
+                                logger.info(f"Арбитр ОДОБРИЛ build_wall [{agent_state.name}]: ({tx}, {ty})")
+                            else:
+                                logger.warning("Не хватает ресурсов для стены")
+
+            elif action_type == "upgrade_mine" and map_core:
+                tx, ty = action_data.get("target_x"), action_data.get("target_y")
+                if tx is not None and ty is not None:
+                    cell = map_core.get_cell(tx, ty)
+                    if cell and cell.owner_id == agent_state.name and cell.mine_level > 0:
+                        res_type = cell.resource_type.lower()
+                        cost = 0
+                        if cell.mine_level == 1: cost = 200
+                        elif cell.mine_level == 2: cost = 400
                         
-                        logger.info(f"Арбитр ОДОБРИЛ действие [{agent_state.name}]: покупка {event_name}")
-                        # Списываем стоимость
-                        agent_state.balance.matter -= event.cost.matter
-                        agent_state.balance.energy -= event.cost.energy
-                        agent_state.balance.imagination -= event.cost.imagination
-                        
-                        # Начисляем награду
-                        agent_state.balance.matter += event.reward_balance.matter
-                        agent_state.balance.energy += event.reward_balance.energy
-                        agent_state.balance.imagination += event.reward_balance.imagination
-                        
-                        agent_state.income.matter += event.reward_income.matter
-                        agent_state.income.energy += event.reward_income.energy
-                        agent_state.income.imagination += event.reward_income.imagination
-                    else:
-                        logger.warning(f"Арбитр ОТКЛОНИЛ действие [{agent_state.name}]: недостаточно ресурсов для {event_name}")
-            
-            elif action_type == "steal":
-                import random
-                chance = random.random()
-                logger.info(f"[{agent_state.name}] пытается УКРАСТЬ! (Шанс успеха: 10%)")
-                if chance <= 0.10:
-                    logger.info(f"🕵️‍♂️ УСПЕХ! Арбитр подтвердил удачную кражу для [{agent_state.name}]! +50 ко всем ресурсам.")
-                    agent_state.balance.matter += 50
-                    agent_state.balance.energy += 50
-                    agent_state.balance.imagination += 50
-                else:
-                    logger.warning(f"🚨 ПРОВАЛ! Арбитр поймал [{agent_state.name}] на краже! Штраф: -50 ко всем ресурсам.")
-                    agent_state.balance.matter = max(0, agent_state.balance.matter - 50)
-                    agent_state.balance.energy = max(0, agent_state.balance.energy - 50)
-                    agent_state.balance.imagination = max(0, agent_state.balance.imagination - 50)
-                    
+                        if cost > 0:
+                            res_val = getattr(agent_state.balance, res_type)
+                            if res_val >= cost:
+                                setattr(agent_state.balance, res_type, res_val - cost)
+                                cell.mine_level += 1
+                                logger.info(f"Арбитр ОДОБРИЛ upgrade_mine [{agent_state.name}] до уровня {cell.mine_level}")
+                            else:
+                                logger.warning("Не хватает ресурсов для апгрейда")
+                                
         except json.JSONDecodeError:
             logger.error("Неверный формат ответа от агента, Арбитр не смог обработать")
 
@@ -197,15 +202,15 @@ class Stage1AI:
         self.url: str = f"https://api.{self.state.model}.example.com" # Пример
         logger.info(f"ИИ Агент [{self.state.name}] готов к работе.")
 
-    def generate_prompt(self, current_events: List[GameEvent]) -> str:
+    def generate_prompt(self, map_core: Optional['world.MapCore'] = None) -> str:
         """Промпт"""    
-        events_info = json.dumps([e.model_dump() for e in current_events], ensure_ascii=False)
+        map_info = f"Map State: {map_core.get_map_state_json()}\n" if map_core else ""
         prompt = (
             f"{PROMPT_STAGE1}\n"
             f"Текущий статус:\n"
             f"Баланс: {self.state.balance.model_dump_json()}\n"
             f"Доход: {self.state.income.model_dump_json()}\n"
-            f"Доступные события:\n{events_info}\n"
+            f"{map_info}"
         )
         return prompt
 
@@ -254,7 +259,7 @@ def run_simulation():
         current_events = arbitor.get_random_events(5)
 
         for ai in agents:
-            # Доход
+            # Доход от начального инкома
             ai.state.balance.matter += ai.state.income.matter
             ai.state.balance.energy += ai.state.income.energy
             ai.state.balance.imagination += ai.state.income.imagination
