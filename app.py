@@ -88,7 +88,7 @@ class SimulationState:
 
                 # Запрос к LLM
                 prompt = ai.generate_prompt(self.map_core)
-                response_raw = engine.api_bridge.send(state.api_key, prompt)
+                response_raw = engine.api_bridge.send(state.api_key, state.model, prompt)
                 
                 action_type = "pass"
                 try:

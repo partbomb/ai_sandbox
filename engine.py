@@ -78,7 +78,7 @@ Return JSON strictly in this format:
 # Ядро
 
 class APIBridge:
-    def send(self, api_key: str, prompt: str) -> str:
+    def send(self, api_key: str, model_name: str, prompt: str) -> str:
         if not api_key or api_key == "ВСТАВЬТЕ_ВАШ_API_КЛЮЧ_СЮДА" or api_key.startswith("sk-"):
             import random
             x = random.randint(0, 4)
@@ -86,10 +86,10 @@ class APIBridge:
             return json.dumps({"action": "capture", "target_x": x, "target_y": y})
             
         try:
-            logger.debug("Отправка реального запроса в Gemini API...")
+            logger.debug(f"Отправка реального запроса в Gemini API ({model_name})...")
             client = genai.Client(api_key=api_key)
             response = client.models.generate_content(
-                model='gemini-3.6-flash',
+                model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json"
@@ -269,7 +269,7 @@ def run_simulation():
             prompt = ai.generate_prompt(current_events)
             
             # API (Имитация ответа агента)
-            response = api_bridge.send(ai.state.api_key, prompt)
+            response = api_bridge.send(ai.state.api_key, ai.state.model, prompt)
 
             # Арбитр проверяет ответ агента
             arbitor.check_elements(ai.state, response, current_events)
