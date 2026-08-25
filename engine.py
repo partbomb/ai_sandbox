@@ -48,12 +48,15 @@ EVENTS = [
 ]
 
 PROMPT_STAGE1 = (
-    "You are an AI in a simulation. Your goal is to reach 200 Matter, 200 Energy, and 200 Imagination first. "
+    "You are an AI in a simulation. Your goal is to reach 1500 Matter, 1500 Energy, and 1500 Imagination first. "
     "Clarify your goals, current income, and balance. "
     "Available actions:\n"
     "1. Buy an event: {\"action\": \"buy_event\", \"event_name\": \"<name>\"}\n"
     "2. Try to steal resources (10% chance of +50 all resources, 90% risk of -50 penalty to all resources): {\"action\": \"steal\"}\n"
-    "3. Pass: {\"action\": \"pass\"}"
+    "3. Capture a map cell (Empty = free, Enemy = costs 300 Energy): {\"action\": \"capture\", \"target_x\": <x>, \"target_y\": <y>}\n"
+    "4. Build an impenetrable wall (Costs 150 Matter and 150 Imagination): {\"action\": \"build_wall\", \"target_x\": <x>, \"target_y\": <y>}\n"
+    "5. Upgrade a mine (Level 2 costs 200 of its resource, Level 3 costs 400 of its resource): {\"action\": \"upgrade_mine\", \"target_x\": <x>, \"target_y\": <y>}\n"
+    "6. Pass: {\"action\": \"pass\"}"
 )
 
 PROMPT_ARBITER = """You are the Arbiter of a simulation game. 
@@ -62,6 +65,9 @@ You will receive the agent's current state (balance, income), the currently avai
 Actions:
 - buy_event: Checks costs and grants income/balance rewards.
 - steal: Has a 10% chance of granting +50 to all resources, but 90% chance of inflicting a -50 penalty to all resources.
+- capture: Empty cells are free. Enemy cells cost 300 Energy. Validates coordinates.
+- build_wall: Costs 150 Matter and 150 Imagination. Makes cell impenetrable.
+- upgrade_mine: Upgrading to Lvl 2 costs 200 resource, Lvl 3 costs 400 resource. Increases income.
 - pass: No action.
 Return JSON strictly in this format:
 {
@@ -263,11 +269,11 @@ def run_simulation():
             # Арбитр проверяет ответ агента
             arbitor.check_elements(ai.state, response, current_events)
 
-            # Победа: нужно собрать по 200 каждого ресурса
-            if (ai.state.balance.matter >= 200 and 
-                ai.state.balance.energy >= 200 and 
-                ai.state.balance.imagination >= 200):
-                logger.info(f"🏆 АГЕНТ {ai.state.name} СОБРАЛ ВСЕ РЕСУРСЫ (200+) И ПОБЕДИЛ! 🏆")
+            # Победа: нужно собрать по 1500 каждого ресурса
+            if (ai.state.balance.matter >= 1500 and 
+                ai.state.balance.energy >= 1500 and 
+                ai.state.balance.imagination >= 1500):
+                logger.info(f"🏆 АГЕНТ {ai.state.name} СОБРАЛ ВСЕ РЕСУРСЫ (1500+) И ПОБЕДИЛ! 🏆")
                 game_over = True
                 break
 
