@@ -113,13 +113,19 @@ class SimulationState:
                 }
                 self.agent_histories[state.name].append(history_entry)
 
-                if action_type == "steal":
-                    self.add_log("STEAL", f"[{state.name}] совершил попытку КРАЖИ!", state.name)
-                elif action_type == "buy_event":
-                    event_name = json.loads(response_raw).get("event_name", "Unknown")
-                    self.add_log("ACTION", f"[{state.name}] купил событие: {event_name}", state.name)
-                else:
+                if action_type == "capture":
+                    tx, ty = action_data.get("target_x"), action_data.get("target_y")
+                    self.add_log("ACTION", f"[{state.name}] ЗАХВАТЫВАЕТ клетку ({tx}, {ty})", state.name)
+                elif action_type == "build_wall":
+                    tx, ty = action_data.get("target_x"), action_data.get("target_y")
+                    self.add_log("ACTION", f"[{state.name}] СТРОИТ СТЕНУ на ({tx}, {ty})", state.name)
+                elif action_type == "upgrade_mine":
+                    tx, ty = action_data.get("target_x"), action_data.get("target_y")
+                    self.add_log("ACTION", f"[{state.name}] УЛУЧШАЕТ ШАХТУ на ({tx}, {ty})", state.name)
+                elif action_type == "pass":
                     self.add_log("ACTION", f"[{state.name}] решил пропустить ход (PASS).", state.name)
+                else:
+                    self.add_log("ACTION", f"[{state.name}] действие: {action_type}", state.name)
 
                 # Победа
                 if (state.balance.matter >= 1500 and 
