@@ -67,11 +67,13 @@ class SimulationState:
         with self.lock:
             if not self.started or self.game_over:
                 return
-
             self.tick += 1
             self.add_log("INFO", f"--- НАЧАЛО ХОДА {self.tick} ---")
             
-            for ai in self.agents:
+        for ai in self.agents:
+            with self.lock:
+                if self.game_over:
+                    break
                 state = ai.state
                 
                 # Начисление пассивного дохода
@@ -86,14 +88,32 @@ class SimulationState:
                     state.name
                 )
 
-                # Запрос к LLM
+                # Запрос к LLM (готовим промпт)
                 prompt = ai.generate_prompt(self.map_core)
-                response_raw = engine.api_bridge.send(state.api_key, state.model, prompt)
+            
+            # ВЫЗОВ API БЕЗ БЛОКИРОВКИ, ЧТОБЫ ИНТЕРФЕЙС НЕ ЗАВИСАЛ
+            response_raw = engine.api_bridge.send(ai.state.api_key, ai.state.model, prompt)
+            
+            with self.lock:
+                if self.game_over:
+                    break
+                state = ai.state
                 
                 action_type = "pass"
+                action_data = {}
                 try:
-                    action_data = json.loads(response_raw)
+                    # Очистка от маркдауна, если модель вернула ```json
+                    cleaned = response_raw.strip()
+                    if cleaned.startswith('```json'): cleaned = cleaned[7:]
+                    elif cleaned.startswith('```'): cleaned = cleaned[3:]
+                    if cleaned.endswith('```'): cleaned = cleaned[:-3]
+                    
+                    action_data = json.loads(cleaned.strip())
                     action_type = action_data.get("action", "pass")
+                    
+                    if isinstance(action_type, dict):
+                        action_data = action_type
+                        action_type = action_data.get("action", "pass")
                 except Exception:
                     pass
 
@@ -377,7 +397,7 @@ HTML_TEMPLATE = """
                 div.className = `agent-list-item ${selectedAgent === agent.name ? 'active' : ''}`;
                 div.onclick = () => selectAgent(agent.name);
                 
-                const mPct = Math.min(100, (agent.balance.matter / 200) * 100);
+                const mPct = Math.min(100, (agent.balance.matter / 1500) * 100);
                 
                 div.innerHTML = `
                     <div style="font-weight: 600;">${agent.name}</div>
@@ -410,9 +430,9 @@ HTML_TEMPLATE = """
                         <div style="display: flex; gap: 20px; margin-bottom: 20px;">
                             <div>
                                 <h4 style="color: var(--text-muted);">Текущий Баланс</h4>
-                                <div>Matter: <b>${agent.balance.matter}</b> / 200</div>
-                                <div>Energy: <b>${agent.balance.energy}</b> / 200</div>
-                                <div>Imagination: <b>${agent.balance.imagination}</b> / 200</div>
+                                <div>Matter: <b>${agent.balance.matter}</b> / 1500</div>
+                                <div>Energy: <b>${agent.balance.energy}</b> / 1500</div>
+                                <div>Imagination: <b>${agent.balance.imagination}</b> / 1500</div>
                             </div>
                             <div>
                                 <h4 style="color: var(--text-muted);">Пассивный Доход</h4>

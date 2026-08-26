@@ -51,12 +51,13 @@ EVENTS = [
 PROMPT_STAGE1 = (
     "You are an AI in a simulation. Your goal is to reach 1500 Matter, 1500 Energy, and 1500 Imagination first. "
     "You are playing on a 5x5 Map. "
-    "Clarify your goals, current income, and balance. "
-    "Available actions:\n"
-    "1. Capture a map cell (Empty = free, Enemy = costs 300 Energy): {\"action\": \"capture\", \"target_x\": <x>, \"target_y\": <y>}\n"
-    "2. Build an impenetrable wall (Costs 150 Matter and 150 Imagination): {\"action\": \"build_wall\", \"target_x\": <x>, \"target_y\": <y>}\n"
-    "3. Upgrade a mine (Level 2 costs 200 of its resource, Level 3 costs 400 of its resource): {\"action\": \"upgrade_mine\", \"target_x\": <x>, \"target_y\": <y>}\n"
-    "4. Pass: {\"action\": \"pass\"}"
+    "You must return ONLY a single JSON object. Do not wrap action inside another action field. "
+    "Put your reasoning in a 'thoughts' field.\n"
+    "Available actions (CHOOSE ONLY ONE):\n"
+    "1. Capture a map cell (Empty = free, Enemy = costs 300 Energy): {\"thoughts\": \"...\", \"action\": \"capture\", \"target_x\": <x>, \"target_y\": <y>}\n"
+    "2. Build an impenetrable wall (Costs 150 Matter and 150 Imagination): {\"thoughts\": \"...\", \"action\": \"build_wall\", \"target_x\": <x>, \"target_y\": <y>}\n"
+    "3. Upgrade a mine (Level 2 costs 200, Level 3 costs 400): {\"thoughts\": \"...\", \"action\": \"upgrade_mine\", \"target_x\": <x>, \"target_y\": <y>}\n"
+    "4. Pass: {\"thoughts\": \"...\", \"action\": \"pass\"}"
 )
 
 PROMPT_ARBITER = """You are the Arbiter of a simulation game. 
@@ -132,9 +133,20 @@ class ArbitorAI:
         logger.debug(f"Arbitor получил промпт для раздумий и проверяет действие...")
         
         try:
-            action_data = json.loads(agent_action)
+            cleaned_action = agent_action.strip()
+            if cleaned_action.startswith('```json'): cleaned_action = cleaned_action[7:]
+            elif cleaned_action.startswith('```'): cleaned_action = cleaned_action[3:]
+            if cleaned_action.endswith('```'): cleaned_action = cleaned_action[:-3]
+            cleaned_action = cleaned_action.strip()
+            
+            action_data = json.loads(cleaned_action)
             action_type = action_data.get("action")
             
+            # Если Gemini обернул ответ в {"action": {"action": "capture", ...}}
+            if isinstance(action_type, dict):
+                action_data = action_type
+                action_type = action_data.get("action")
+                
             if action_type == "capture" and map_core:
                 tx, ty = action_data.get("target_x"), action_data.get("target_y")
                 if tx is not None and ty is not None:
