@@ -21,9 +21,9 @@ logger.addHandler(console_handler)
 
 # Модели
 class Resources(BaseModel):
-    matter: int = 0
-    energy: int = 0
-    imagination: int = 0
+    matter: int = 500
+    energy: int = 500
+    imagination: int = 500
 
 class AgentState(BaseModel):
     name: str
@@ -56,9 +56,10 @@ EVENTS = [
 ]
 
 PROMPT_STAGE1 = (
-    "You are an AI in a simulation. Your goal is to reach 1500 of all resources. "
+    "You are an AI in a simulation. Your ULTIMATE GOAL is to reach Technological Singularity! "
+    "To win, you must build the 'Server Core', which requires 5000 Matter, 5000 Energy, and 5000 Imagination.\n"
+    "WARNING (HUNGER): You automatically lose 15 Energy every turn just to survive! If your Energy drops below 0, you DIE and drop all resources!\n"
     "You are on a 5x5 Map (coordinates X: 0-4, Y: 0-4), but you only see a radius of 2 around your Avatar. "
-    "If your HP drops to 0, you die, drop all resources, and respawn in 5 turns. "
     "You must return ONLY a single JSON object. Put your reasoning in 'thoughts'.\n"
     "Available actions (CHOOSE ONLY ONE):\n"
     "1. Move (Costs 10 Energy. You can ONLY move to an adjacent cell or stay, distance <= 1): {\"thoughts\": \"...\", \"action\": \"move\", \"target_x\": <x>, \"target_y\": <y>}\n"
@@ -67,7 +68,8 @@ PROMPT_STAGE1 = (
     "4. Build Wall (Costs 150 Matter, 150 Imagination, gives 100 HP wall. MUST be adjacent): {\"thoughts\": \"...\", \"action\": \"build_wall\", \"target_x\": <x>, \"target_y\": <y>}\n"
     "5. Repair Wall (Costs 50 Matter, gives +50 HP. MUST be adjacent): {\"thoughts\": \"...\", \"action\": \"repair_wall\", \"target_x\": <x>, \"target_y\": <y>}\n"
     "6. Upgrade a mine (Level 2 costs 200, Level 3 costs 400. MUST be adjacent): {\"thoughts\": \"...\", \"action\": \"upgrade_mine\", \"target_x\": <x>, \"target_y\": <y>}\n"
-    "7. Pass (Wait for passive income): {\"thoughts\": \"...\", \"action\": \"pass\"}"
+    "7. Pass (Wait for passive income): {\"thoughts\": \"...\", \"action\": \"pass\"}\n"
+    "8. Build Core (Costs 5000 M, 5000 E, 5000 I. WINS THE GAME): {\"thoughts\": \"...\", \"action\": \"build_core\"}"
 )
 
 PROMPT_ARBITER = """You are the Arbiter of a simulation game. 
@@ -325,6 +327,14 @@ class ArbitorAI:
                                 return False, f"[{agent_state.name}] ОТКЛОНЕНО upgrade: не хватает ресурсов"
                         return False, f"[{agent_state.name}] ОТКЛОНЕНО upgrade: максимальный уровень"
                     return False, f"[{agent_state.name}] ОТКЛОНЕНО upgrade: не ваша шахта"
+            elif action_type == "build_core":
+                if agent_state.balance.matter >= 5000 and agent_state.balance.energy >= 5000 and agent_state.balance.imagination >= 5000:
+                    agent_state.balance.matter -= 5000
+                    agent_state.balance.energy -= 5000
+                    agent_state.balance.imagination -= 5000
+                    return True, f"[{agent_state.name}] ПОСТРОИЛ СЕРВЕРНОЕ ЯДРО!"
+                else:
+                    return False, f"[{agent_state.name}] ОТКЛОНЕНО build_core: нужно по 5000 каждого ресурса"
             elif action_type == "pass":
                 return True, f"[{agent_state.name}] пропустил ход"
                                 

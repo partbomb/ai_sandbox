@@ -92,6 +92,9 @@ class SimulationState:
                         ai.state.hp = 100
                         ai.state.x = ai.state.home_x
                         ai.state.y = ai.state.home_y
+                        ai.state.balance.matter = 500
+                        ai.state.balance.energy = 500
+                        ai.state.balance.imagination = 500
                         self.add_log("INFO", f"[{ai.state.name}] ВОЗРОДИЛСЯ на ({ai.state.x}, {ai.state.y})!", ai.state.name)
                     continue
 
@@ -103,9 +106,31 @@ class SimulationState:
                 state.balance.energy += state.income.energy + passive_inc["energy"]
                 state.balance.imagination += state.income.imagination + passive_inc["imagination"]
                 
+                # Hunger tax (Налог на существование)
+                tax = 15
+                state.balance.energy -= tax
+                
+                if state.balance.energy < 0:
+                    state.balance.energy = 0
+                    state.is_dead = True
+                    state.respawn_timer = 5
+                    self.add_log("WARNING", f"[{state.name}] УМЕР ОТ ГОЛОДА (Энергия упала ниже нуля)!", state.name)
+                    
+                    # Drop loot
+                    cell = self.map_core.get_cell(state.x, state.y) if hasattr(self, 'map_core') else None
+                    if cell:
+                        cell.loot['matter'] = cell.loot.get('matter', 0) + state.balance.matter
+                        cell.loot['energy'] = cell.loot.get('energy', 0) + state.balance.energy
+                        cell.loot['imagination'] = cell.loot.get('imagination', 0) + state.balance.imagination
+                    
+                    state.balance.matter = 0
+                    state.balance.energy = 0
+                    state.balance.imagination = 0
+                    continue
+
                 self.add_log(
                     "INCOME", 
-                    f"[{state.name}] получил доход (+{state.income.matter + passive_inc['matter']}M, +{state.income.energy + passive_inc['energy']}E, +{state.income.imagination + passive_inc['imagination']}I). Баланс: {state.balance.matter}M, {state.balance.energy}E, {state.balance.imagination}I",
+                    f"[{state.name}] доход (+{state.income.matter + passive_inc['matter']}M, +{state.income.energy + passive_inc['energy']}E, +{state.income.imagination + passive_inc['imagination']}I). Налог: -{tax}E. Баланс: {state.balance.matter}M, {state.balance.energy}E, {state.balance.imagination}I",
                     state.name
                 )
 
@@ -158,13 +183,11 @@ class SimulationState:
                 self.add_log(log_level, msg, state.name)
 
                 # Победа
-                if (state.balance.matter >= 1500 and 
-                    state.balance.energy >= 1500 and 
-                    state.balance.imagination >= 1500):
+                if action_type == "build_core" and success:
                     self.game_over = True
                     self.winner = state.name
                     self.is_auto_running = False
-                    self.add_log("VICTORY", f"🏆 АГЕНТ {state.name} ДОСТИГ 1500 ВСЕХ РЕСУРСОВ И ПОБЕДИЛ! 🏆", state.name)
+                    self.add_log("VICTORY", f"🏆 АГЕНТ {state.name} ПОСТРОИЛ СЕРВЕРНОЕ ЯДРО И ДОСТИГ СИНГУЛЯРНОСТИ! 🏆", state.name)
                     break
 
 sim = SimulationState()
