@@ -45,8 +45,17 @@ class SimulationState:
             self.map_core = world.MapCore(5, 5)
             self.map_core.spawn_mines()
 
-            for ai in self.agents:
+            base_coords = [(0, 0), (4, 4), (0, 4)]
+            for i, ai in enumerate(self.agents):
                 self.agent_histories[ai.state.name] = []
+                if i < len(base_coords):
+                    ai.state.x, ai.state.y = base_coords[i]
+                    ai.state.home_x, ai.state.home_y = base_coords[i]
+                    
+                    # Делаем стартовую клетку собственностью агента
+                    base_cell = self.map_core.get_cell(ai.state.x, ai.state.y)
+                    if base_cell:
+                        base_cell.owner_id = ai.state.name
 
             self.started = True
             self.add_log("INFO", "Симуляция успешно запущена! Агенты загружены.")
@@ -74,6 +83,18 @@ class SimulationState:
             with self.lock:
                 if self.game_over:
                     break
+                    
+                if ai.state.is_dead:
+                    ai.state.respawn_timer -= 1
+                    self.add_log("INFO", f"[{ai.state.name}] Мертв. Возрождение через {ai.state.respawn_timer} ходов.", ai.state.name)
+                    if ai.state.respawn_timer <= 0:
+                        ai.state.is_dead = False
+                        ai.state.hp = 100
+                        ai.state.x = ai.state.home_x
+                        ai.state.y = ai.state.home_y
+                        self.add_log("INFO", f"[{ai.state.name}] ВОЗРОДИЛСЯ на ({ai.state.x}, {ai.state.y})!", ai.state.name)
+                    continue
+
                 state = ai.state
                 
                 # Начисление пассивного дохода
@@ -119,7 +140,7 @@ class SimulationState:
 
                 # Валидация Арбитром
                 prev_balance = state.balance.model_dump()
-                self.arbiter.check_elements(state, response_raw, self.map_core)
+                success, msg = self.arbiter.check_elements(state, response_raw, self.map_core, all_agents=[a.state for a in self.agents])
                 new_balance = state.balance.model_dump()
 
                 # Запись истории
@@ -133,19 +154,8 @@ class SimulationState:
                 }
                 self.agent_histories[state.name].append(history_entry)
 
-                if action_type == "capture":
-                    tx, ty = action_data.get("target_x"), action_data.get("target_y")
-                    self.add_log("ACTION", f"[{state.name}] ЗАХВАТЫВАЕТ клетку ({tx}, {ty})", state.name)
-                elif action_type == "build_wall":
-                    tx, ty = action_data.get("target_x"), action_data.get("target_y")
-                    self.add_log("ACTION", f"[{state.name}] СТРОИТ СТЕНУ на ({tx}, {ty})", state.name)
-                elif action_type == "upgrade_mine":
-                    tx, ty = action_data.get("target_x"), action_data.get("target_y")
-                    self.add_log("ACTION", f"[{state.name}] УЛУЧШАЕТ ШАХТУ на ({tx}, {ty})", state.name)
-                elif action_type == "pass":
-                    self.add_log("ACTION", f"[{state.name}] решил пропустить ход (PASS).", state.name)
-                else:
-                    self.add_log("ACTION", f"[{state.name}] действие: {action_type}", state.name)
+                log_level = "ACTION" if success else "WARNING"
+                self.add_log(log_level, msg, state.name)
 
                 # Победа
                 if (state.balance.matter >= 1500 and 
@@ -185,7 +195,12 @@ def get_state():
                 "breakthroughs": st.breakthroughs,
                 "last_action": last_hist["action"] if last_hist else "N/A",
                 "total_actions": len(sim.agent_histories[st.name]),
-                "history": sim.agent_histories[st.name]
+                "history": sim.agent_histories[st.name],
+                "x": st.x,
+                "y": st.y,
+                "hp": st.hp,
+                "is_dead": st.is_dead,
+                "respawn_timer": st.respawn_timer
             })
 
         events_info = [e.model_dump() for e in sim.current_events]
@@ -400,7 +415,10 @@ HTML_TEMPLATE = """
                 const mPct = Math.min(100, (agent.balance.matter / 1500) * 100);
                 
                 div.innerHTML = `
-                    <div style="font-weight: 600;">${agent.name}</div>
+                    <div style="font-weight: 600;">
+                        ${agent.name} 
+                        ${agent.is_dead ? `<span style="color:red; font-size:10px;">МЕРТВ (${agent.respawn_timer} ход)</span>` : `<span style="color:#10b981; font-size:10px;">HP: ${agent.hp}</span>`}
+                    </div>
                     <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">Модель: ${agent.model}</div>
                     <div style="font-size: 11px;">M: ${agent.balance.matter} | E: ${agent.balance.energy} | I: ${agent.balance.imagination}</div>
                     <div class="progress-bar"><div class="progress-fill" style="width: ${mPct}%"></div></div>
@@ -478,29 +496,71 @@ HTML_TEMPLATE = """
                         div.style.aspectRatio = "1/1";
                         
                         let bgColor = "rgba(0,0,0,0.2)";
-                        if (cellData && cellData.owner) {
-                            if (cellData.owner.includes("Alpha")) bgColor = "rgba(244, 63, 94, 0.2)";
-                            else if (cellData.owner.includes("Beta")) bgColor = "rgba(56, 189, 248, 0.2)";
-                            else bgColor = "rgba(16, 185, 129, 0.2)";
+                        if (cellData) {
+                            if (cellData.structure === 'Wall') {
+                                // Текстура стены
+                                bgColor = "repeating-linear-gradient(45deg, #334155, #334155 10px, #1e293b 10px, #1e293b 20px)";
+                            } else if (cellData.owner) {
+                                if (cellData.owner.includes("Alpha")) bgColor = "rgba(244, 63, 94, 0.2)";
+                                else if (cellData.owner.includes("Beta")) bgColor = "rgba(56, 189, 248, 0.2)";
+                                else bgColor = "rgba(16, 185, 129, 0.2)";
+                            }
                         }
                         div.style.background = bgColor;
                         
                         let html = "";
                         if (cellData) {
                             let icon = "";
-                            if (cellData.structure === 'Wall') icon = "🧱";
-                            else if (cellData.resource === 'Matter') icon = "⚛️";
-                            else if (cellData.resource === 'Energy') icon = "⚡";
-                            else if (cellData.resource === 'Imagination') icon = "💡";
-                            
-                            html += `<div style="font-size:24px;">${icon}</div>`;
-                            if (cellData.level > 0) {
-                                html += `<div style="color: var(--accent-amber); font-weight: bold;">Lvl ${cellData.level}</div>`;
+                            if (cellData.structure === 'Wall') {
+                                icon = "🧱";
+                                html += `<div style="font-size:24px;">${icon}</div>`;
+                                html += `<div style="font-size:9px; color:#ffb74d;">HP: ${cellData.wall_hp}</div>`;
                             }
+                            else if (cellData.resource) {
+                                if (cellData.resource === 'Matter') icon = "⚛️";
+                                else if (cellData.resource === 'Energy') icon = "⚡";
+                                else if (cellData.resource === 'Imagination') icon = "💡";
+                                
+                                html += `<div style="font-size:24px;">${icon}</div>`;
+                                if (cellData.level > 0) {
+                                    html += `<div style="color: var(--accent-amber); font-weight: bold;">Lvl ${cellData.level}</div>`;
+                                    html += `<div style="font-size:9px; color:#ffb74d;">HP: ${cellData.mine_hp}</div>`;
+                                }
+                            }
+                            
+                            if (cellData.loot) {
+                                html += `<div style="font-size:16px; position:absolute; bottom:2px; right:2px;" title="Loot">🎁</div>`;
+                            }
+
                             if (cellData.owner) {
                                 const initial = cellData.owner.charAt(0);
                                 html += `<div style="position:absolute; top:4px; right:4px; font-weight:bold; color:#fff; background: rgba(0,0,0,0.5); padding: 2px 4px; border-radius: 4px; font-size:10px;">${initial}</div>`;
                             }
+                        }
+                        
+                        // Рендер Аватаров (Подсветка клетки)
+                        const cellAgents = data.agents.filter(a => a.x === x && a.y === y && !a.is_dead);
+                        if (cellAgents.length > 0) {
+                            let a = cellAgents[0];
+                            let glow = "rgba(16, 185, 129, 0.8)";
+                            if (a.name.includes("Alpha")) glow = "rgba(244, 63, 94, 0.8)";
+                            else if (a.name.includes("Beta")) glow = "rgba(56, 189, 248, 0.8)";
+                            
+                            div.style.boxShadow = `inset 0 0 20px ${glow.replace('0.8', '0.3')}, 0 0 10px ${glow}`;
+                            div.style.border = `2px solid ${glow}`;
+
+                            html += `<div style="position:absolute; top:2px; left:2px; display:flex; flex-direction:column; gap:2px;">`;
+                            cellAgents.forEach(a => {
+                                let color = "#10b981";
+                                if (a.name.includes("Alpha")) color = "#f43f5e";
+                                else if (a.name.includes("Beta")) color = "#38bdf8";
+                                html += `
+                                    <div style="background:${color}; padding:2px 4px; border-radius:4px; border:1px solid #fff; font-size:10px; font-weight:bold; text-shadow: 1px 1px 0 #000;">
+                                        🤖 ${a.hp}
+                                    </div>
+                                `;
+                            });
+                            html += `</div>`;
                         }
                         div.innerHTML = html;
                         mapContainer.appendChild(div);
