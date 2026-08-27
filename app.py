@@ -1,263 +1,201 @@
 import json
 import logging
 import threading
+import asyncio
 import time
-import random
-from typing import List, Dict, Any, Optional
+from typing import List
 from flask import Flask, jsonify, request, render_template_string
-from pydantic import BaseModel
-import engine
 import world
 
 app = Flask(__name__)
 
-# --- Состояние веб-симуляции ---
-class SimulationState:
+# --- АСИНХРОННЫЙ МОСТ ФЛАСК <-> СИМУЛЯЦИЯ ---
+
+class WebState:
     def __init__(self):
-        self.lock = threading.Lock()
         self.started = False
         self.tick = 0
-        self.game_over = False
-        self.winner = None
-        self.is_auto_running = False
-        self.auto_speed = 1.0  # секунды между ходами
         self.logs = []
-        self.agent_histories = {}
-        self.agents = []
-        self.arbiter = engine.ArbitorAI()
-        self.current_events = []
-        self.map_core = world.MapCore(5, 5)
+        self.world_map: world.MapCore = None
+        self.agents: List[world.Stage2AI] = []
+        self.arbiter: world.ArbitorPhysical = None
+        self.tasks = []
+        
+        # Создаем луп в отдельном потоке
+        self.async_loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+        
+        # Запускаем фоновый цикл для глобального тика один раз
+        asyncio.run_coroutine_threadsafe(self._map_tick_loop(), self.async_loop)
 
-    def start_or_reset(self):
-        with self.lock:
-            self.tick = 0
-            self.game_over = False
-            self.winner = None
-            self.is_auto_running = False
-            self.logs = []
-            self.agent_histories = {}
-            
-            # Загрузка агентов из свежего agents_config.json
-            agents_data = engine.load_agents("agents_config.json")
-            self.arbiter = engine.ArbitorAI()
-            self.agents = [engine.Stage1AI(state) for state in agents_data]
-            self.current_events = []
-            self.map_core = world.MapCore(5, 5)
-            self.map_core.spawn_mines()
+    def _run_loop(self):
+        asyncio.set_event_loop(self.async_loop)
+        self.async_loop.run_forever()
 
-            base_coords = [(0, 0), (4, 4), (0, 4)]
-            for i, ai in enumerate(self.agents):
-                self.agent_histories[ai.state.name] = []
-                if i < len(base_coords):
-                    ai.state.x, ai.state.y = base_coords[i]
-                    ai.state.home_x, ai.state.home_y = base_coords[i]
+    async def _map_tick_loop(self):
+        while True:
+            if self.started and self.world_map:
+                self.tick += 1
+                async with self.world_map.lock:
+                    alive_agents = [a for a in self.agents if not a.is_dead]
+                    total_mines = sum(1 for row in self.world_map.grid for c in row if c.resource_type is not None)
                     
-                    # Делаем стартовую клетку собственностью агента
-                    base_cell = self.map_core.get_cell(ai.state.x, ai.state.y)
-                    if base_cell:
-                        base_cell.owner_id = ai.state.name
+                    for agent in self.agents:
+                        if agent.is_dead:
+                            continue
+                            
+                        # Очки за территории
+                        agent.score = sum(1 for row in self.world_map.grid for cell in row if cell.owner_id == agent.name)
+                        
+                        # Доход от захваченных шахт
+                        matter_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Matter')
+                        energy_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Energy')
+                        imag_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Imagination')
+                        
+                        agent.balance["matter"] += matter_mines * 10
+                        agent.balance["energy"] += energy_mines * 10
+                        agent.balance["imagination"] += imag_mines * 10
+                        
+                        # Налог на существование (Голод)
+                        agent.balance["energy"] -= 5
+                        
+                        if agent.balance["energy"] <= 0:
+                            agent.balance["energy"] = 0
+                            agent.is_dead = True
+                            self.add_log("TICK", f"💀 {agent.name} ПОГИБ ОТ ГОЛОДА (0 Энергии)!")
+                            continue
+                            
+                        # Проверка на победу (Сингулярность)
+                        if agent.balance["matter"] >= 5000 and agent.balance["energy"] >= 5000 and agent.balance["imagination"] >= 5000:
+                            self.add_log("TICK", f"🏆 {agent.name} ДОСТИГ ТЕХНОЛОГИЧЕСКОЙ СИНГУЛЯРНОСТИ И ПОБЕДИЛ!")
+                            self.started = False
+                            break
+                            
+                        # Проверка на победу (Монополия)
+                        agent_mines = matter_mines + energy_mines + imag_mines
+                        if total_mines > 0 and (agent_mines / total_mines) >= 0.8:
+                            self.add_log("TICK", f"🏆 {agent.name} ДОСТИГ АБСОЛЮТНОЙ МОНОПОЛИИ (80% шахт) И ПОБЕДИЛ!")
+                            self.started = False
+                            break
+                    
+                    # Проверка на победу (Battle Royale)
+                    alive_now = [a for a in self.agents if not a.is_dead]
+                    if len(alive_now) == 1 and len(self.agents) > 1:
+                        self.add_log("TICK", f"👑 {alive_now[0].name} УНИЧТОЖИЛ ВСЕХ И ПОБЕДИЛ В BATTLE ROYALE!")
+                        self.started = False
+                    elif len(alive_now) == 0 and len(self.agents) > 0:
+                        self.add_log("TICK", "💀 ВСЕ АГЕНТЫ ПОГИБЛИ. КОНЕЦ ИГРЫ.")
+                        self.started = False
+                        
+                    if not self.started:
+                        for task in self.tasks: task.cancel()
+                        self.tasks.clear()
+            await asyncio.sleep(2.0)
 
-            self.started = True
-            self.add_log("INFO", "Симуляция успешно запущена! Агенты загружены.")
+    def add_log(self, level, message):
 
-    def add_log(self, level: str, message: str, agent_name: Optional[str] = None):
-        log_entry = {
-            "tick": self.tick,
-            "timestamp": time.strftime("%H:%M:%S"),
-            "level": level,
-            "message": message,
-            "agent": agent_name
-        }
-        self.logs.append(log_entry)
-        if len(self.logs) > 300:
+        self.logs.append({
+            "timestamp": time.strftime("%H:%M:%S"), 
+            "level": level, 
+            "message": message
+        })
+        if len(self.logs) > 150: 
             self.logs.pop(0)
 
-    def do_step(self):
-        with self.lock:
-            if not self.started or self.game_over:
-                return
-            self.tick += 1
-            self.add_log("INFO", f"--- НАЧАЛО ХОДА {self.tick} ---")
-            
-        for ai in self.agents:
-            with self.lock:
-                if self.game_over:
-                    break
-                    
-                if ai.state.is_dead:
-                    ai.state.respawn_timer -= 1
-                    self.add_log("INFO", f"[{ai.state.name}] Мертв. Возрождение через {ai.state.respawn_timer} ходов.", ai.state.name)
-                    if ai.state.respawn_timer <= 0:
-                        ai.state.is_dead = False
-                        ai.state.hp = 100
-                        ai.state.x = ai.state.home_x
-                        ai.state.y = ai.state.home_y
-                        ai.state.balance.matter = 500
-                        ai.state.balance.energy = 500
-                        ai.state.balance.imagination = 500
-                        self.add_log("INFO", f"[{ai.state.name}] ВОЗРОДИЛСЯ на ({ai.state.x}, {ai.state.y})!", ai.state.name)
-                    continue
+web_state = WebState()
 
-                state = ai.state
-                
-                # Начисление пассивного дохода
-                passive_inc = self.map_core.calculate_passive_income(state.name) if hasattr(self, 'map_core') else {"matter": 0, "energy": 0, "imagination": 0}
-                state.balance.matter += state.income.matter + passive_inc["matter"]
-                state.balance.energy += state.income.energy + passive_inc["energy"]
-                state.balance.imagination += state.income.imagination + passive_inc["imagination"]
-                
-                # Hunger tax (Налог на существование)
-                tax = 15
-                state.balance.energy -= tax
-                
-                if state.balance.energy < 0:
-                    state.balance.energy = 0
-                    state.is_dead = True
-                    state.respawn_timer = 5
-                    self.add_log("WARNING", f"[{state.name}] УМЕР ОТ ГОЛОДА (Энергия упала ниже нуля)!", state.name)
-                    
-                    # Drop loot
-                    cell = self.map_core.get_cell(state.x, state.y) if hasattr(self, 'map_core') else None
-                    if cell:
-                        cell.loot['matter'] = cell.loot.get('matter', 0) + state.balance.matter
-                        cell.loot['energy'] = cell.loot.get('energy', 0) + state.balance.energy
-                        cell.loot['imagination'] = cell.loot.get('imagination', 0) + state.balance.imagination
-                    
-                    state.balance.matter = 0
-                    state.balance.energy = 0
-                    state.balance.imagination = 0
-                    continue
+# Перехват логов из world.py в наш web_state
+class WebLogHandler(logging.Handler):
+    def emit(self, record):
+        level = record.levelname
+        msg = record.getMessage()
+        if "ГЛОБАЛЬНЫЙ" in msg: 
+            level = "TICK"
+        else:
+            # Для агентов оставляем INFO/WARNING/ERROR
+            pass
+        web_state.add_log(level, msg)
 
-                self.add_log(
-                    "INCOME", 
-                    f"[{state.name}] доход (+{state.income.matter + passive_inc['matter']}M, +{state.income.energy + passive_inc['energy']}E, +{state.income.imagination + passive_inc['imagination']}I). Налог: -{tax}E. Баланс: {state.balance.matter}M, {state.balance.energy}E, {state.balance.imagination}I",
-                    state.name
-                )
+logging.getLogger("WorldMap").addHandler(WebLogHandler())
 
-                # Запрос к LLM (готовим промпт)
-                prompt = ai.generate_prompt(self.map_core)
-            
-            # ВЫЗОВ API БЕЗ БЛОКИРОВКИ, ЧТОБЫ ИНТЕРФЕЙС НЕ ЗАВИСАЛ
-            response_raw = engine.api_bridge.send(ai.state.api_key, ai.state.model, prompt)
-            
-            with self.lock:
-                if self.game_over:
-                    break
-                state = ai.state
-                
-                action_type = "pass"
-                action_data = {}
-                try:
-                    # Очистка от маркдауна, если модель вернула ```json
-                    cleaned = response_raw.strip()
-                    if cleaned.startswith('```json'): cleaned = cleaned[7:]
-                    elif cleaned.startswith('```'): cleaned = cleaned[3:]
-                    if cleaned.endswith('```'): cleaned = cleaned[:-3]
-                    
-                    action_data = json.loads(cleaned.strip())
-                    action_type = action_data.get("action", "pass")
-                    
-                    if isinstance(action_type, dict):
-                        action_data = action_type
-                        action_type = action_data.get("action", "pass")
-                except Exception:
-                    pass
-
-                # Валидация Арбитром
-                prev_balance = state.balance.model_dump()
-                success, msg = self.arbiter.check_elements(state, response_raw, self.map_core, all_agents=[a.state for a in self.agents])
-                new_balance = state.balance.model_dump()
-
-                # Запись истории
-                history_entry = {
-                    "tick": self.tick,
-                    "action": action_type,
-                    "raw_response": response_raw,
-                    "prev_balance": prev_balance,
-                    "new_balance": new_balance,
-                    "income": state.income.model_dump()
-                }
-                self.agent_histories[state.name].append(history_entry)
-
-                log_level = "ACTION" if success else "WARNING"
-                self.add_log(log_level, msg, state.name)
-
-                # Победа
-                if action_type == "build_core" and success:
-                    self.game_over = True
-                    self.winner = state.name
-                    self.is_auto_running = False
-                    self.add_log("VICTORY", f"🏆 АГЕНТ {state.name} ПОСТРОИЛ СЕРВЕРНОЕ ЯДРО И ДОСТИГ СИНГУЛЯРНОСТИ! 🏆", state.name)
-                    break
-
-sim = SimulationState()
-
-def auto_run_loop():
-    while True:
-        time.sleep(sim.auto_speed)
-        if sim.is_auto_running and not sim.game_over:
-            sim.do_step()
-
-auto_thread = threading.Thread(target=auto_run_loop, daemon=True)
-auto_thread.start()
-
-# --- API Endpoints ---
-
-@app.route('/api/state', methods=['GET'])
-def get_state():
-    with sim.lock:
-        agents_info = []
-        for ai in sim.agents:
-            st = ai.state
-            last_hist = sim.agent_histories[st.name][-1] if sim.agent_histories[st.name] else None
-            agents_info.append({
-                "name": st.name,
-                "model": st.model,
-                "balance": st.balance.model_dump(),
-                "income": st.income.model_dump(),
-                "breakthroughs": st.breakthroughs,
-                "last_action": last_hist["action"] if last_hist else "N/A",
-                "total_actions": len(sim.agent_histories[st.name]),
-                "history": sim.agent_histories[st.name],
-                "x": st.x,
-                "y": st.y,
-                "hp": st.hp,
-                "is_dead": st.is_dead,
-                "respawn_timer": st.respawn_timer
-            })
-
-        events_info = [e.model_dump() for e in sim.current_events]
-
-        return jsonify({
-            "started": sim.started,
-            "tick": sim.tick,
-            "game_over": sim.game_over,
-            "winner": sim.winner,
-            "is_auto_running": sim.is_auto_running,
-            "auto_speed": sim.auto_speed,
-            "agents": agents_info,
-            "events": events_info,
-            "logs": sim.logs[-100:],
-            "map": json.loads(sim.map_core.get_map_state_json()) if hasattr(sim, 'map_core') else []
-        })
+# --- API ---
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
-    sim.start_or_reset()
+    try:
+        with open("agents_config.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+    
+    # Инициализация мира 10x10
+    web_state.world_map = world.MapCore(width=10, height=10)
+    web_state.world_map.spawn_mines()
+    web_state.arbiter = world.ArbitorPhysical()
+    
+    import random
+    web_state.agents = []
+    
+    # Динамическая загрузка всех агентов
+    for agent_data in data.get("agents", []):
+        # Назначаем случайную позицию
+        pos = world.Position(x=random.randint(0, 9), y=random.randint(0, 9))
+        agent_obj = world.Stage2AI(agent_data["name"], agent_data["api_key"], agent_data["model"], pos, agent_data.get("income", {}))
+        web_state.agents.append(agent_obj)
+    
+    web_state.tick = 0
+    web_state.logs = []
+    web_state.add_log("INFO", "=== ЗАПУСК ФАЗЫ 2 (КАРТА) ===")
+    
+    # Отменяем старые таски если есть
+    for task in web_state.tasks:
+        task.cancel()
+    web_state.tasks.clear()
+    
+    # Запускаем независимые циклы для каждого агента
+    for agent in web_state.agents:
+        task = asyncio.run_coroutine_threadsafe(world.agent_loop(agent, web_state.world_map, web_state.arbiter, web_state.agents), web_state.async_loop)
+        web_state.tasks.append(task)
+        
+    web_state.started = True
     return jsonify({"success": True})
 
-@app.route('/api/step', methods=['POST'])
-def api_step():
-    sim.do_step()
-    return jsonify({"success": True, "tick": sim.tick})
 
-@app.route('/api/toggle_auto', methods=['POST'])
-def api_toggle_auto():
-    with sim.lock:
-        sim.is_auto_running = not sim.is_auto_running
-    return jsonify({"is_auto_running": sim.is_auto_running})
+@app.route('/api/state', methods=['GET'])
+def get_state():
+    if not web_state.started:
+        return jsonify({"started": False})
+        
+    grid_data = []
+    for y in range(web_state.world_map.height):
+        row = []
+        for x in range(web_state.world_map.width):
+            cell = web_state.world_map.grid[x][y]
+            avatar = next((a.name for a in web_state.agents if a.position.x == x and a.position.y == y), None)
+            
+            row.append({
+                "x": x, "y": y,
+                "owner": cell.owner_id,
+                "resource": cell.resource_type,
+                "structure": cell.structure,
+                "avatar": avatar
+            })
+        grid_data.append(row)
+        
+    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead} for a in web_state.agents]
+    
+    return jsonify({
+        "started": True,
+        "tick": web_state.tick,
+        "map": grid_data,
+        "agents": agents_data,
+        "logs": web_state.logs
+    })
 
-# --- UI HTML ---
+
+# --- WEB UI ---
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
@@ -268,7 +206,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Sandbox</title>
+    <title>AI Sandbox - Phase 2</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -276,329 +214,220 @@ HTML_TEMPLATE = """
             --card-bg: rgba(21, 29, 46, 0.7);
             --card-border: rgba(255, 255, 255, 0.08);
             --accent-cyan: #06b6d4;
-            --accent-emerald: #10b981;
-            --accent-amber: #f59e0b;
+            --accent-red: #ef4444;
+            --accent-blue: #3b82f6;
             --text-main: #f8fafc;
             --text-muted: #94a3b8;
         }
 
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Outfit', sans-serif; }
-        body { background-color: var(--bg-dark); color: var(--text-main); min-height: 100vh; display: flex; flex-direction: column; }
+        body { background-color: var(--bg-dark); color: var(--text-main); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
         
         header {
             display: flex; justify-content: space-between; align-items: center;
             background: var(--card-bg); border-bottom: 1px solid var(--card-border);
-            padding: 16px 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            padding: 16px 24px;
         }
-        .brand { font-size: 20px; font-weight: 700; color: var(--accent-cyan); }
-        .controls { display: flex; gap: 12px; align-items: center; }
         
-        .btn {
-            background: rgba(255,255,255,0.05); border: 1px solid var(--card-border);
-            color: #fff; padding: 8px 16px; border-radius: 8px; cursor: pointer; transition: 0.2s;
-        }
-        .btn:hover { background: rgba(255,255,255,0.1); }
-        .btn-primary { background: linear-gradient(135deg, var(--accent-cyan), #0284c7); border: none; }
-        .btn-success { background: linear-gradient(135deg, var(--accent-emerald), #059669); border: none; }
-        
-        .tick-badge { font-weight: bold; color: var(--accent-amber); margin-right: 16px; }
-
-        .start-screen {
-            flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-        }
         .start-btn {
-            font-size: 24px; padding: 16px 40px; border-radius: 12px; background: linear-gradient(135deg, #a855f7, var(--accent-cyan));
-            color: #fff; border: none; cursor: pointer; box-shadow: 0 10px 30px rgba(168, 85, 247, 0.4); transition: 0.3s;
+            background: linear-gradient(135deg, var(--accent-cyan), #0284c7);
+            color: #fff; border: none; padding: 10px 20px; border-radius: 8px;
+            font-weight: 600; cursor: pointer; transition: 0.2s;
         }
-        .start-btn:hover { transform: scale(1.05); }
+        .start-btn:hover { filter: brightness(1.2); }
+        
+        .main-layout { display: flex; flex: 1; height: calc(100vh - 65px); }
+        
+        .sidebar { width: 300px; border-right: 1px solid var(--card-border); background: var(--card-bg); padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+        .agent-card {
+            background: rgba(255,255,255,0.03); border: 1px solid var(--card-border);
+            border-radius: 12px; padding: 16px;
+        }
+        .agent-card h3 { margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+        
+        .map-container { flex: 1; display: flex; align-items: center; justify-content: center; background: radial-gradient(circle, #1a2333 0%, var(--bg-dark) 100%); }
+        
+        .map-grid {
+            display: grid; gap: 4px; padding: 10px; background: rgba(0,0,0,0.3); border-radius: 12px;
+            border: 1px solid var(--card-border);
+        }
+        .cell {
+            width: 48px; height: 48px; background: rgba(255,255,255,0.05); border-radius: 8px;
+            display: flex; align-items: center; justify-content: center; font-size: 24px;
+            position: relative; border: 2px solid transparent; transition: 0.3s;
+        }
+        
+        .avatar-badge {
+            position: absolute; right: -6px; top: -6px; width: 20px; height: 20px;
+            border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 10px rgba(0,0,0,0.5);
+            display: flex; align-items: center; justify-content: center; font-size: 10px; z-index: 10;
+        }
 
-        .main-layout {
-            display: none; /* Скрыто до запуска */
-            flex: 1; padding: 20px; display: grid; grid-template-columns: 300px 1fr; gap: 20px; height: calc(100vh - 70px);
-        }
-
-        /* Левая панель - Список ИИ */
-        .sidebar { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 16px; overflow-y: auto; }
-        .agent-list-item {
-            padding: 12px; border: 1px solid transparent; border-radius: 8px; cursor: pointer;
-            background: rgba(255,255,255,0.02); margin-bottom: 8px; transition: 0.2s;
-        }
-        .agent-list-item:hover { background: rgba(255,255,255,0.05); border-color: var(--card-border); }
-        .agent-list-item.active { background: rgba(6, 182, 212, 0.1); border-color: var(--accent-cyan); }
+        .terminal-container { width: 350px; background: #050811; border-left: 1px solid var(--card-border); display: flex; flex-direction: column; }
+        .terminal-header { padding: 12px 16px; background: var(--card-bg); border-bottom: 1px solid var(--card-border); font-weight: 600; font-family: 'JetBrains Mono'; font-size: 14px; }
+        .terminal { flex: 1; padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
         
-        /* Правая панель - Детали и Консоль */
-        .content-area { display: flex; flex-direction: column; gap: 20px; overflow: hidden; }
-        
-        .agent-details { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 20px; flex: 1; overflow-y: auto; }
-        .agent-details h2 { color: var(--accent-cyan); margin-bottom: 12px; }
-        
-        .terminal {
-            background: #050811; border: 1px solid var(--card-border); border-radius: 12px; padding: 16px;
-            font-family: 'JetBrains Mono', monospace; font-size: 13px; height: 35%; overflow-y: auto;
-        }
-        .log-item { line-height: 1.5; margin-bottom: 4px; }
-        
-        .progress-bar { height: 6px; background: rgba(255,255,255,0.1); border-radius: 4px; margin-top: 4px; }
-        .progress-fill { height: 100%; border-radius: 4px; background: var(--accent-cyan); }
+        .log-TICK { color: #f59e0b; font-weight: bold; }
+        .log-INFO { color: var(--text-muted); }
     </style>
 </head>
 <body>
 
     <header>
-        <div class="brand">🤖 AI Sandbox</div>
-        <div class="controls" id="headerControls" style="display: none;">
-            <div class="tick-badge">⏱️ ХОД: <span id="tickCounter">0</span></div>
-            <button class="btn btn-primary" onclick="doStep()">▶️ Сделать ход</button>
-            <button class="btn btn-success" id="autoBtn" onclick="toggleAuto()">⏯️ Авто-запуск</button>
-            <button class="btn" onclick="startSim()">🔄 Сброс (Перезагрузить JSON)</button>
+        <div style="font-size: 20px; font-weight: 700; color: var(--accent-cyan);">🤖 AI Sandbox - Phase 2 (Async Grid)</div>
+        <div style="display: flex; gap: 16px; align-items: center;">
+            <div id="tickCounter" style="font-weight: 600; color: #f59e0b; display: none;">⏱️ ТИК: 0</div>
+            <button class="start-btn" onclick="startSim()" id="startBtn">ЗАПУСТИТЬ СИМУЛЯЦИЮ</button>
         </div>
     </header>
 
-    <div class="start-screen" id="startScreen">
-        <h1 style="margin-bottom: 24px; font-size: 32px;">Симуляция готова к запуску</h1>
-        <p style="color: var(--text-muted); margin-bottom: 32px;">Настройки агентов будут загружены из agents_config.json</p>
-        <button class="start-btn" onclick="startSim()">ЗАПУСТИТЬ СИМУЛЯЦИЮ</button>
-    </div>
-
-    <div class="main-layout" id="mainLayout">
-        <div class="sidebar">
-            <h3 style="margin-bottom: 16px; color: var(--text-muted);">Список Агентов</h3>
-            <div id="agentList"></div>
+    <div class="main-layout" id="mainLayout" style="display: none;">
+        <div class="sidebar" id="sidebar"></div>
+        <div class="map-container">
+            <div class="map-grid" id="mapGrid"></div>
         </div>
-
-        <div class="content-area">
-            <div style="display: flex; gap: 20px; flex: 1; overflow: hidden;">
-                <div class="agent-details" id="agentDetails" style="flex: 1;">
-                    <div style="color: var(--text-muted); text-align: center; margin-top: 40px;">
-                        Выберите агента из списка слева, чтобы увидеть подробную информацию и логи ходов.
-                    </div>
-                </div>
-                <div class="map-container" style="flex: 1; background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 20px; display: flex; align-items: center; justify-content: center;">
-                    <div id="mapGrid" style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; width: 100%; max-width: 400px; aspect-ratio: 1/1;">
-                    </div>
-                </div>
-            </div>
-
+        <div class="terminal-container">
+            <div class="terminal-header">Логи (Real-time)</div>
             <div class="terminal" id="terminalLog"></div>
         </div>
     </div>
 
     <script>
-        let selectedAgent = null;
-        let globalData = null;
+        let isStarted = false;
 
-        async function fetchState() {
+        async function init() {
             try {
                 const res = await fetch('/api/state');
                 const data = await res.json();
-                globalData = data;
-                renderUI(data);
-            } catch (err) {
-                console.error("API error:", err);
-            }
+                if(data.started) {
+                    isStarted = true;
+                    document.getElementById('startBtn').style.display = 'none';
+                    document.getElementById('tickCounter').style.display = 'block';
+                    document.getElementById('mainLayout').style.display = 'flex';
+                    fetchStateLoop();
+                }
+            } catch(e) {}
         }
 
         async function startSim() {
+            document.getElementById('startBtn').innerText = "Запускается...";
             await fetch('/api/start', { method: 'POST' });
-            selectedAgent = null;
-            document.getElementById('startScreen').style.display = 'none';
-            document.getElementById('mainLayout').style.display = 'grid';
-            document.getElementById('headerControls').style.display = 'flex';
-            fetchState();
+            isStarted = true;
+            document.getElementById('startBtn').style.display = 'none';
+            document.getElementById('tickCounter').style.display = 'block';
+            document.getElementById('mainLayout').style.display = 'flex';
+            fetchStateLoop();
         }
 
-        async function doStep() { await fetch('/api/step', { method: 'POST' }); fetchState(); }
-        async function toggleAuto() { await fetch('/api/toggle_auto', { method: 'POST' }); fetchState(); }
-
-        function selectAgent(name) {
-            selectedAgent = name;
-            renderUI(globalData);
-        }
-
-        function renderUI(data) {
-            if (!data.started) {
-                document.getElementById('startScreen').style.display = 'flex';
-                document.getElementById('mainLayout').style.display = 'none';
-                document.getElementById('headerControls').style.display = 'none';
-                return;
-            }
-
-            document.getElementById('tickCounter').innerText = data.tick;
-            document.getElementById('autoBtn').innerText = data.is_auto_running ? "⏸️ Пауза" : "⏯️ Авто-запуск";
-
-            // Рендер списка агентов
-            const listContainer = document.getElementById('agentList');
-            listContainer.innerHTML = '';
-            
-            data.agents.forEach(agent => {
-                const div = document.createElement('div');
-                div.className = `agent-list-item ${selectedAgent === agent.name ? 'active' : ''}`;
-                div.onclick = () => selectAgent(agent.name);
+        async function fetchStateLoop() {
+            if (!isStarted) return;
+            try {
+                const res = await fetch('/api/state');
+                const data = await res.json();
                 
-                const mPct = Math.min(100, (agent.balance.matter / 1500) * 100);
-                
-                div.innerHTML = `
-                    <div style="font-weight: 600;">
-                        ${agent.name} 
-                        ${agent.is_dead ? `<span style="color:red; font-size:10px;">МЕРТВ (${agent.respawn_timer} ход)</span>` : `<span style="color:#10b981; font-size:10px;">HP: ${agent.hp}</span>`}
-                    </div>
-                    <div style="font-size: 11px; color: var(--text-muted); margin-bottom: 4px;">Модель: ${agent.model}</div>
-                    <div style="font-size: 11px;">M: ${agent.balance.matter} | E: ${agent.balance.energy} | I: ${agent.balance.imagination}</div>
-                    <div class="progress-bar"><div class="progress-fill" style="width: ${mPct}%"></div></div>
-                `;
-                listContainer.appendChild(div);
-            });
-
-            // Рендер деталей выбранного агента
-            const detailsContainer = document.getElementById('agentDetails');
-            if (selectedAgent) {
-                const agent = data.agents.find(a => a.name === selectedAgent);
-                if (agent) {
-                    let historyHtml = agent.history.slice().reverse().map(h => `
-                        <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--card-border); padding: 12px; border-radius: 8px; margin-bottom: 8px;">
-                            <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
-                                <b>Ход ${h.tick}</b>
-                                <span style="color: var(--accent-amber);">${h.action}</span>
-                            </div>
-                            <div style="font-family: monospace; font-size: 11px; color: #94a3b8; background: #000; padding: 8px; border-radius: 4px;">
-                                Raw: ${h.raw_response}
-                            </div>
-                        </div>
-                    `).join('');
-
-                    detailsContainer.innerHTML = `
-                        <h2>${agent.name} <span style="font-size: 14px; color: var(--text-muted);">(${agent.model})</span></h2>
-                        <div style="display: flex; gap: 20px; margin-bottom: 20px;">
-                            <div>
-                                <h4 style="color: var(--text-muted);">Текущий Баланс</h4>
-                                <div>Matter: <b>${agent.balance.matter}</b> / 1500</div>
-                                <div>Energy: <b>${agent.balance.energy}</b> / 1500</div>
-                                <div>Imagination: <b>${agent.balance.imagination}</b> / 1500</div>
-                            </div>
-                            <div>
-                                <h4 style="color: var(--text-muted);">Пассивный Доход</h4>
-                                <div>Matter: +${agent.income.matter}</div>
-                                <div>Energy: +${agent.income.energy}</div>
-                                <div>Imagination: +${agent.income.imagination}</div>
-                            </div>
-                        </div>
-                        <h3 style="margin-bottom: 10px; color: var(--text-muted);">История ответов:</h3>
-                        <div>${historyHtml || '<p>Действий еще нет.</p>'}</div>
-                    `;
+                if(data.started) {
+                    document.getElementById('tickCounter').innerText = `⏱️ ТИК: ${data.tick}`;
+                    renderAgents(data.agents);
+                    renderMap(data.map);
+                    renderLogs(data.logs);
                 }
-            }
-
-            // Рендер терминала
-            const terminal = document.getElementById('terminalLog');
-            terminal.innerHTML = data.logs.map(log => 
-                `<div class="log-item">
-                    <span style="color: #64748b;">[${log.timestamp}]</span> 
-                    <span style="color: ${log.level === 'STEAL' ? '#f59e0b' : (log.level === 'VICTORY' ? '#f43f5e' : '#38bdf8')};">
-                        ${log.message}
-                    </span>
-                </div>`
-            ).join('');
-            terminal.scrollTop = terminal.scrollHeight;
+            } catch(e) {}
             
-            // Рендер карты
-            const mapContainer = document.getElementById('mapGrid');
-            if (data.map) {
-                mapContainer.innerHTML = '';
-                for(let y=0; y<5; y++){
-                    for(let x=0; x<5; x++){
-                        const cellData = data.map.find(c => c.x === x && c.y === y);
-                        const div = document.createElement('div');
-                        div.style.border = "1px solid rgba(255,255,255,0.1)";
-                        div.style.borderRadius = "4px";
-                        div.style.display = "flex";
-                        div.style.flexDirection = "column";
-                        div.style.alignItems = "center";
-                        div.style.justifyContent = "center";
-                        div.style.fontSize = "11px";
-                        div.style.position = "relative";
-                        div.style.aspectRatio = "1/1";
-                        
-                        let bgColor = "rgba(0,0,0,0.2)";
-                        if (cellData) {
-                            if (cellData.structure === 'Wall') {
-                                // Текстура стены
-                                bgColor = "repeating-linear-gradient(45deg, #334155, #334155 10px, #1e293b 10px, #1e293b 20px)";
-                            } else if (cellData.owner) {
-                                if (cellData.owner.includes("Alpha")) bgColor = "rgba(244, 63, 94, 0.2)";
-                                else if (cellData.owner.includes("Beta")) bgColor = "rgba(56, 189, 248, 0.2)";
-                                else bgColor = "rgba(16, 185, 129, 0.2)";
-                            }
-                        }
-                        div.style.background = bgColor;
-                        
-                        let html = "";
-                        if (cellData) {
-                            let icon = "";
-                            if (cellData.structure === 'Wall') {
-                                icon = "🧱";
-                                html += `<div style="font-size:24px;">${icon}</div>`;
-                                html += `<div style="font-size:9px; color:#ffb74d;">HP: ${cellData.wall_hp}</div>`;
-                            }
-                            else if (cellData.resource) {
-                                if (cellData.resource === 'Matter') icon = "⚛️";
-                                else if (cellData.resource === 'Energy') icon = "⚡";
-                                else if (cellData.resource === 'Imagination') icon = "💡";
-                                
-                                html += `<div style="font-size:24px;">${icon}</div>`;
-                                if (cellData.level > 0) {
-                                    html += `<div style="color: var(--accent-amber); font-weight: bold;">Lvl ${cellData.level}</div>`;
-                                    html += `<div style="font-size:9px; color:#ffb74d;">HP: ${cellData.mine_hp}</div>`;
-                                }
-                            }
-                            
-                            if (cellData.loot) {
-                                html += `<div style="font-size:16px; position:absolute; bottom:2px; right:2px;" title="Loot">🎁</div>`;
-                            }
+            setTimeout(fetchStateLoop, 500); // 2 FPS update
+        }
 
-                            if (cellData.owner) {
-                                const initial = cellData.owner.charAt(0);
-                                html += `<div style="position:absolute; top:4px; right:4px; font-weight:bold; color:#fff; background: rgba(0,0,0,0.5); padding: 2px 4px; border-radius: 4px; font-size:10px;">${initial}</div>`;
-                            }
-                        }
-                        
-                        // Рендер Аватаров (Подсветка клетки)
-                        const cellAgents = data.agents.filter(a => a.x === x && a.y === y && !a.is_dead);
-                        if (cellAgents.length > 0) {
-                            let a = cellAgents[0];
-                            let glow = "rgba(16, 185, 129, 0.8)";
-                            if (a.name.includes("Alpha")) glow = "rgba(244, 63, 94, 0.8)";
-                            else if (a.name.includes("Beta")) glow = "rgba(56, 189, 248, 0.8)";
-                            
-                            div.style.boxShadow = `inset 0 0 20px ${glow.replace('0.8', '0.3')}, 0 0 10px ${glow}`;
-                            div.style.border = `2px solid ${glow}`;
+        // Использование уникальных цветов для агентов
+        const distinctColors = ["#ef4444", "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316"];
+        const agentColorMap = {};
+        let colorCounter = 0;
+        function stringToColor(str) {
+            if (!agentColorMap[str]) {
+                agentColorMap[str] = distinctColors[colorCounter % distinctColors.length];
+                colorCounter++;
+            }
+            return agentColorMap[str];
+        }
 
-                            html += `<div style="position:absolute; top:2px; left:2px; display:flex; flex-direction:column; gap:2px;">`;
-                            cellAgents.forEach(a => {
-                                let color = "#10b981";
-                                if (a.name.includes("Alpha")) color = "#f43f5e";
-                                else if (a.name.includes("Beta")) color = "#38bdf8";
-                                html += `
-                                    <div style="background:${color}; padding:2px 4px; border-radius:4px; border:1px solid #fff; font-size:10px; font-weight:bold; text-shadow: 1px 1px 0 #000;">
-                                        🤖 ${a.hp}
-                                    </div>
-                                `;
-                            });
-                            html += `</div>`;
-                        }
-                        div.innerHTML = html;
-                        mapContainer.appendChild(div);
+        function renderAgents(agents) {
+            const sidebar = document.getElementById('sidebar');
+            sidebar.innerHTML = agents.map(a => {
+                const color = a.is_dead ? '#475569' : stringToColor(a.name);
+                const title = a.is_dead ? `💀 ${a.name} (МЕРТВ)` : `🤖 ${a.name}`;
+                return `
+                <div class="agent-card" style="border-left: 4px solid ${color}; opacity: ${a.is_dead ? 0.6 : 1}">
+                    <h3 style="color: ${color}">${title}</h3>
+                    <div style="font-size: 14px;">Координаты: X:${a.x}, Y:${a.y}</div>
+                    <div style="font-size: 12px; margin-top: 6px;">Ресурсы (до 5000):</div>
+                    <div style="font-size: 11px;">M: ${a.balance.matter} | E: ${a.balance.energy} | I: ${a.balance.imagination}</div>
+                    <div style="font-size: 14px; margin-top: 6px;">Счет (Клетки): <b>${a.score}</b></div>
+                </div>
+            `}).join('');
+        }
+
+        function renderMap(grid) {
+            const mapEl = document.getElementById('mapGrid');
+            if(mapEl.style.gridTemplateColumns === "") {
+                mapEl.style.gridTemplateColumns = `repeat(${grid[0].length}, 48px)`;
+                mapEl.style.gridTemplateRows = `repeat(${grid.length}, 48px)`;
+            }
+            
+            let html = '';
+            for (let y = 0; y < grid.length; y++) {
+                for (let x = 0; x < grid[y].length; x++) {
+                    const cell = grid[y][x];
+                    
+                    let content = '';
+                    if (cell.structure === 'Wall') content = '🧱';
+                    else if (cell.resource === 'Matter') content = '⚛️';
+                    else if (cell.resource === 'Energy') content = '⚡';
+                    else if (cell.resource === 'Imagination') content = '💡';
+
+                    let cellStyle = '';
+                    if (cell.owner) {
+                        const color = stringToColor(cell.owner);
+                        cellStyle = `border-color: ${color}; background: ${color}20;`; // 20 - alpha opacity hex
                     }
+
+                    let avatarHtml = '';
+                    if (cell.avatar) {
+                        const avatarColor = stringToColor(cell.avatar);
+                        avatarHtml = `<div class="avatar-badge" style="background: ${avatarColor};">🤖</div>`;
+                    }
+                    
+                    html += `<div class="cell" style="${cellStyle}">${content}${avatarHtml}</div>`;
                 }
             }
+            mapEl.innerHTML = html;
         }
 
-        setInterval(fetchState, 1000);
-        fetchState();
+        function renderLogs(logs) {
+            const term = document.getElementById('terminalLog');
+            const atBottom = term.scrollHeight - term.scrollTop <= term.clientHeight + 20;
+            
+            term.innerHTML = logs.map(l => {
+                let msgColor = 'inherit';
+                if(l.message.includes('] ->')) {
+                    const agentName = l.message.split(']')[0].replace('[', '');
+                    msgColor = stringToColor(agentName);
+                }
+                return `
+                <div class="log-${l.level}">
+                    <span style="color: #475569">[${l.timestamp}]</span> <span style="color: ${msgColor}">${l.message}</span>
+                </div>
+            `}).join('');
+            
+            if (atBottom) {
+                term.scrollTop = term.scrollHeight;
+            }
+        }
+        
+        // Проверяем состояние при загрузке
+        init();
     </script>
 </body>
 </html>
 """
 
 if __name__ == '__main__':
-    print("🚀 Запуск веб-панели управления AI Sandbox на http://127.0.0.1:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    print("🚀 Запуск веб-панели управления Фазы 2 на http://127.0.0.1:5000")
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
