@@ -2,8 +2,7 @@ import json
 import logging
 import random
 import asyncio
-import time
-from typing import List, Optional, Dict
+from typing import List, Optional
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
@@ -109,59 +108,76 @@ class Stage2AI:
         self.api_key = api_key
         self.model = model
         self.position = start_pos
+        self.base_position = Position(x=start_pos.x, y=start_pos.y)
         self.score = 0
         self.is_dead = False
+        self.hp = 100
+        self.respawn_timer = 0
         self.balance = {"matter": 50, "energy": 50, "imagination": 50}
         self.income = init_income
+        self.memory = []
+
+        self.client = genai.Client(api_key=self.api_key) if self.api_key and not self.api_key.startswith("sk-") and "test" not in self.api_key.lower() else None
 
     def generate_prompt(self, map_core: MapCore) -> str:
-        surroundings = map_core.get_map_state_json(self.position.x, self.position.y, radius=1)
+        surroundings = map_core.get_map_state_json(self.position.x, self.position.y, radius=2)
         prompt = (
-            f"You are AI Agent '{self.name}' on a 2D grid map.\n"
-            f"Your position: X:{self.position.x}, Y:{self.position.y}.\n"
+            f"You are AI Agent '{self.name}' on a 10x10 map (X:0-9, Y:0-9).\n"
+            f"Your position: X:{self.position.x}, Y:{self.position.y}. HP: {self.hp}/100.\n"
             f"Your balance: Matter={self.balance['matter']}, Energy={self.balance['energy']}, Imagination={self.balance['imagination']}.\n"
-            f"WARNING (Hunger): Every tick you lose 5 Energy! If Energy reaches 0, you DIE! Capture Energy mines (⚡) immediately!\n"
+            f"MEMORY LOG (Last actions and results):\n"
+            f"{chr(10).join(self.memory) if self.memory else 'No memories yet.'}\n\n"
             f"WIN CONDITIONS:\n"
             f"1. Singularity: 5000 of all resources.\n"
             f"2. Monopoly: Capture 80% of all resource mines.\n"
-            f"3. Battle Royale: ATTACK and kill all other agents.\n"
-            f"Surrounding cells (radius 1):\n{surroundings}\n\n"
+            f"3. Battle Royale: Kill all other agents.\n"
+            f"RULES & MECHANICS:\n"
+            f"- MOVE: Navigate the map. Blocked by Walls or Enemies. Loot is auto-picked up.\n"
+            f"- ATTACK (Cost: 5 Energy): Deals 25 damage. Targets: Enemies, Walls, or Mines. Drops Matter when breaking walls/mines.\n"
+            f"- BUILD (Cost: 20 Matter): Builds a Wall on an adjacent cell to block movement.\n"
+            f"- CAPTURE (Cost: 10 Imagination): Reprograms a mine to give you passive income. Requires cell to be clear of enemies/walls.\n"
+            f"MAP BOUNDARIES: DO NOT move outside 0-9! If you are at Y=0, you CANNOT move N. If Y=9, you CANNOT move S. If X=0, you CANNOT move W. If X=9, you CANNOT move E.\n"
+            f"Surrounding cells (radius 2):\n{surroundings}\n\n"
             f"Available actions (return strictly JSON):\n"
             f"1. MOVE: {{\"action\": \"MOVE\", \"params\": {{\"direction\": \"N\"}}}} (N, S, E, W)\n"
-            f"2. CAPTURE: {{\"action\": \"CAPTURE\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}\n"
-            f"3. ATTACK: {{\"action\": \"ATTACK\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}\n"
-            f"4. STEAL: {{\"action\": \"STEAL\"}} (10% chance to steal +50 all resources, 90% chance to lose -50)\n"
-            f"5. PASS: {{\"action\": \"PASS\"}}"
+            f"2. ATTACK: {{\"action\": \"ATTACK\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}\n"
+            f"3. BUILD: {{\"action\": \"BUILD\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}\n"
+            f"4. CAPTURE: {{\"action\": \"CAPTURE\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}\n"
+            f"5. PASS: {{\"action\": \"PASS\"}}\n"
+            f"THINK BEFORE YOU ACT. Add a 'thought' field in your JSON explaining your strategy.\n"
         )
         return prompt
 
     async def get_action_from_llm(self, map_core: MapCore) -> dict:
         prompt = self.generate_prompt(map_core)
         
-        # Если API-ключ - заглушка, возвращаем рандомное действие мгновенно
         if not self.api_key or self.api_key.startswith("sk-") or "test" in self.api_key.lower():
-            await asyncio.sleep(0.5) # Имитация задержки сети
-            moves = ["N", "S", "E", "W"]
-            action = random.choice(["MOVE", "MOVE", "CAPTURE"])
-            if action == "MOVE":
-                return {"action": "MOVE", "params": {"direction": random.choice(moves)}}
-            else:
-                return {"action": "CAPTURE", "params": {"target_x": self.position.x, "target_y": self.position.y}}
+            await asyncio.sleep(0.5) 
+            return {"action": "PASS"}
 
         try:
-            # Асинхронный вызов API (через to_thread, так как SDK синхронный)
-            client = genai.Client(api_key=self.api_key)
+            if not self.client:
+                await asyncio.sleep(0.5)
+                return {"action": "PASS"}
+            
             def _call_api():
-                return client.models.generate_content(
+                return self.client.models.generate_content(
                     model=self.model,
                     contents=prompt,
                     config=types.GenerateContentConfig(response_mime_type="application/json")
                 )
-            response = await asyncio.to_thread(_call_api)
+            
+            # Добавлен жесткий таймаут 7 секунд. Если API (Google SDK) начинает 
+            # бесконечно ретраить из-за Rate Limit 15 RPM, мы прерываем ожидание,
+            # чтобы агент не "завис" навсегда.
+            response = await asyncio.wait_for(asyncio.to_thread(_call_api), timeout=7.0)
             return json.loads(response.text)
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.name}] LLM Timeout (Rate Limit/Slow response). Пропускаем ход.")
+            return {"action": "PASS"}
         except Exception as e:
             logger.error(f"[{self.name}] LLM Error: {e}")
-            await asyncio.sleep(2) # Пауза при ошибке
+            await asyncio.sleep(2) 
             return {"action": "PASS"}
 
 
@@ -174,8 +190,12 @@ class ArbitorPhysical:
         return (dx <= 1 and dy <= 1)
 
     async def execute_action(self, avatar: Stage2AI, action_data: dict, map_core: MapCore, all_agents: List[Stage2AI]) -> str:
-        # Используем lock, так как меняем общее состояние карты
         async with map_core.lock:
+            if avatar.is_dead:
+                return "Вы мертвы и не можете действовать."
+                
+            if not isinstance(action_data, dict):
+                action_data = {}
             action = action_data.get("action", "PASS")
             params = action_data.get("params", {})
             
@@ -190,42 +210,97 @@ class ArbitorPhysical:
                 new_x, new_y = avatar.position.x + dx, avatar.position.y + dy
                 target_cell = map_core.get_cell(new_x, new_y)
                 if target_cell and target_cell.structure != 'Wall':
+                    enemy_here = next((a for a in all_agents if a.position.x == new_x and a.position.y == new_y and a.name != avatar.name and not a.is_dead), None)
+                    if enemy_here:
+                        return f"Движение заблокировано врагом {enemy_here.name}."
+                        
                     avatar.position = Position(x=new_x, y=new_y)
-                    return f"Переместился на {direction} ({new_x}, {new_y})"
+                    pickup_msg = ""
+                    for res in ['matter', 'energy', 'imagination']:
+                        if target_cell.loot.get(res, 0) > 0:
+                            amt = target_cell.loot[res]
+                            avatar.balance[res] += amt
+                            target_cell.loot[res] = 0
+                            pickup_msg += f" Подобрано {amt} {res}."
+                    return f"Переместился на {direction} ({new_x}, {new_y})." + pickup_msg
                 return "Стена или край карты."
 
-            elif action == "CAPTURE":
-                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
-                target_cell = map_core.get_cell(tx, ty)
-                if target_cell and self.is_adjacent(avatar.position, Position(x=tx, y=ty)):
-                    if target_cell.owner_id is None or target_cell.owner_id == avatar.name:
-                        target_cell.owner_id = avatar.name
-                        return f"Захватил ({tx}, {ty})"
-                return "Нельзя захватить."
-
-            elif action == "STEAL":
-                if random.random() <= 0.10:
-                    avatar.balance["matter"] += 50
-                    avatar.balance["energy"] += 50
-                    avatar.balance["imagination"] += 50
-                    return "УСПЕХ! Украл +50 всех ресурсов."
-                else:
-                    avatar.balance["matter"] = max(0, avatar.balance["matter"] - 50)
-                    avatar.balance["energy"] = max(0, avatar.balance["energy"] - 50)
-                    avatar.balance["imagination"] = max(0, avatar.balance["imagination"] - 50)
-                    return "ПРОВАЛ кражи! Штраф -50 всех ресурсов."
-            
             elif action == "ATTACK":
+                if avatar.balance["energy"] < 5:
+                    return "Недостаточно Энергии (Нужно 5) для атаки."
+                avatar.balance["energy"] -= 5
+                
                 tx, ty = params.get("target_x", -1), params.get("target_y", -1)
-                if self.is_adjacent(avatar.position, Position(x=tx, y=ty)):
-                    # Ищем агента на этой клетке
-                    enemy = next((a for a in all_agents if a.position.x == tx and a.position.y == ty and a.name != avatar.name and not a.is_dead), None)
-                    if enemy:
+                if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)) and not (avatar.position.x == tx and avatar.position.y == ty):
+                    return "Цель вне зоны досягаемости."
+                    
+                target_cell = map_core.get_cell(tx, ty)
+                enemy = next((a for a in all_agents if a.position.x == tx and a.position.y == ty and a.name != avatar.name and not a.is_dead), None)
+                
+                if enemy:
+                    enemy.hp -= 25
+                    if enemy.hp <= 0:
                         enemy.is_dead = True
+                        enemy.respawn_timer = 5
+                        for res in ['matter', 'energy', 'imagination']:
+                            target_cell.loot[res] = target_cell.loot.get(res, 0) + enemy.balance[res]
+                            enemy.balance[res] = 0
                         return f"УСПЕШНО АТАКОВАЛ И УБИЛ {enemy.name} на ({tx}, {ty})!"
-                    else:
-                        return f"На ({tx}, {ty}) нет врагов для атаки."
-                return "Цель вне радиуса атаки."
+                    return f"Нанес 25 урона {enemy.name}. Осталось HP: {enemy.hp}."
+                elif target_cell and target_cell.structure == 'Wall':
+                    target_cell.wall_hp -= 25
+                    avatar.balance["matter"] += 2
+                    if target_cell.wall_hp <= 0:
+                        target_cell.structure = None
+                        return "Стена разрушена! Получено 2 Материи."
+                    return f"Удар по стене. Осталось HP: {target_cell.wall_hp}."
+                elif target_cell and target_cell.resource_type:
+                    target_cell.mine_hp -= 25
+                    avatar.balance["matter"] += 5
+                    if target_cell.mine_hp <= 0:
+                        target_cell.resource_type = None
+                        target_cell.owner_id = None
+                        return "Шахта полностью разрушена! Получено 5 Материи."
+                    return f"Удар по шахте. Осталось HP: {target_cell.mine_hp}."
+                else:
+                    return f"На ({tx}, {ty}) нет подходящей цели для атаки."
+                    
+            elif action == "BUILD":
+                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)):
+                    return "Цель вне зоны досягаемости."
+                if avatar.balance["matter"] < 20:
+                    return "Недостаточно Материи (нужно 20) для постройки стены."
+                target_cell = map_core.get_cell(tx, ty)
+                if not target_cell or target_cell.structure == 'Wall':
+                    return "Здесь уже есть постройка или край карты."
+                
+                enemy_here = any(a.position.x == tx and a.position.y == ty and not a.is_dead for a in all_agents)
+                if enemy_here: return "Невозможно строить: на клетке кто-то стоит."
+                
+                avatar.balance["matter"] -= 20
+                target_cell.structure = 'Wall'
+                target_cell.wall_hp = 100
+                return "Стена успешно построена."
+
+            elif action == "CAPTURE":
+                if avatar.balance["imagination"] < 10:
+                    return "Недостаточно Воображения (нужно 10) для захвата."
+                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)) and not (avatar.position.x == tx and avatar.position.y == ty):
+                    return "Слишком далеко для захвата."
+                target_cell = map_core.get_cell(tx, ty)
+                if not target_cell: return "Край карты."
+                
+                enemy_here = any(a.position.x == tx and a.position.y == ty and a.name != avatar.name and not a.is_dead for a in all_agents)
+                if enemy_here: return "Невозможно захватить: на клетке враг!"
+                if target_cell.structure == 'Wall': return "Невозможно захватить: мешает стена!"
+                
+                if target_cell.resource_type:
+                    avatar.balance["imagination"] -= 10
+                    target_cell.owner_id = avatar.name
+                    return f"Шахта на ({tx}, {ty}) перепрограммирована и захвачена."
+                return "Здесь нет шахты для захвата."
 
             return f"Действие {action} обработано."
 
@@ -252,19 +327,31 @@ async def map_render_loop(map_core: MapCore, agents: List[Stage2AI]):
 async def agent_loop(agent: Stage2AI, map_core: MapCore, arbiter: ArbitorPhysical, all_agents: List[Stage2AI]):
     """Жизненный цикл отдельного агента. Работает независимо от других."""
     while True:
-        if agent.is_dead:
-            await asyncio.sleep(2.0)
-            continue
+        try:
+            if agent.is_dead:
+                await asyncio.sleep(2.0)
+                continue
+                
+            # Агент думает (ждем ответа LLM)
+            action_data = await agent.get_action_from_llm(map_core)
             
-        # Агент думает (ждем ответа LLM)
-        action_data = await agent.get_action_from_llm(map_core)
-        
-        # Агент применяет действие к карте
-        result = await arbiter.execute_action(agent, action_data, map_core, all_agents)
-        logger.info(f"[{agent.name}] -> {action_data.get('action')} | {result}")
-        
-        # Ускоряем время ожидания для быстрого отклика
-        await asyncio.sleep(2.5) 
+            # Агент применяет действие к карте
+            if agent.is_dead:
+                continue
+            result = await arbiter.execute_action(agent, action_data, map_core, all_agents)
+            logger.info(f"[{agent.name}] -> {action_data.get('action')} | {result}")
+            
+            # Сохраняем результат в память ИИ
+            action_name = action_data.get('action', 'UNKNOWN')
+            agent.memory.append(f"- Used {action_name}: {result}")
+            if len(agent.memory) > 10:
+                agent.memory = agent.memory[-10:]
+            
+            # Ускоряем время ожидания для быстрого отклика
+            await asyncio.sleep(2.5) 
+        except Exception as e:
+            logger.error(f"[{agent.name}] LOOP CRASHED: {e}")
+            await asyncio.sleep(2.0)
 
 async def main_simulation():
     logger.info("=== ЗАПУСК АСИНХРОННОЙ ФАЗЫ 2 (REAL-TIME) ===")

@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from typing import List, Dict, Any, Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -91,6 +91,9 @@ Return JSON strictly in this format:
 # Ядро
 
 class APIBridge:
+    def __init__(self):
+        self.clients = {}
+
     def send(self, api_key: str, model_name: str, prompt: str) -> str:
         if not api_key or api_key == "ВСТАВЬТЕ_ВАШ_API_КЛЮЧ_СЮДА" or api_key.startswith("sk-"):
             import random
@@ -100,7 +103,10 @@ class APIBridge:
             
         try:
             logger.debug(f"Отправка реального запроса в Gemini API ({model_name})...")
-            client = genai.Client(api_key=api_key)
+            if api_key not in self.clients:
+                self.clients[api_key] = genai.Client(api_key=api_key)
+            client = self.clients[api_key]
+            
             response = client.models.generate_content(
                 model=model_name,
                 contents=prompt,
@@ -137,13 +143,7 @@ class ArbitorAI:
         if agent_state.is_dead:
             return False, f"[{agent_state.name}] Мертв. Пропуск хода."
 
-        map_info = f"Карта: {map_core.get_map_state_json(agent_state.x, agent_state.y, 2)}\n" if map_core else ""
-        prompt = (
-            f"{PROMPT_ARBITER}\n"
-            f"Текущий статус агента:\nБаланс: {agent_state.balance.model_dump_json()}\nДоход: {agent_state.income.model_dump_json()}\n"
-            f"{map_info}"
-            f"Действие агента: {agent_action}"
-        )
+        # (Промпт арбитра был удален, так как арбитр работает на жесткой логике Python)
         
         logger.debug(f"Arbitor получил промпт для раздумий и проверяет действие...")
         

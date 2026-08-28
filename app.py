@@ -4,7 +4,7 @@ import threading
 import asyncio
 import time
 from typing import List
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, render_template_string
 import world
 
 app = Flask(__name__)
@@ -35,62 +35,69 @@ class WebState:
 
     async def _map_tick_loop(self):
         while True:
-            if self.started and self.world_map:
-                self.tick += 1
-                async with self.world_map.lock:
-                    alive_agents = [a for a in self.agents if not a.is_dead]
-                    total_mines = sum(1 for row in self.world_map.grid for c in row if c.resource_type is not None)
-                    
-                    for agent in self.agents:
-                        if agent.is_dead:
-                            continue
+            try:
+                if self.started and self.world_map:
+                    self.tick += 1
+                    async with self.world_map.lock:
+                        total_mines = sum(1 for row in self.world_map.grid for c in row if c.resource_type is not None)
+                        
+                        for agent in self.agents:
+                            if agent.is_dead:
+                                if getattr(agent, 'respawn_timer', 0) > 0:
+                                    agent.respawn_timer -= 1
+                                    if agent.respawn_timer <= 0:
+                                        agent.is_dead = False
+                                        agent.hp = 100
+                                        agent.balance = {"matter": 50, "energy": 50, "imagination": 50}
+                                        agent.position = world.Position(x=agent.base_position.x, y=agent.base_position.y)
+                                        self.add_log("TICK", f"✨ {agent.name} ВОЗРОДИЛСЯ на базе!")
+                                        logging.info(f"[{agent.name}] ✨ ВОЗРОДИЛСЯ на базе!")
+                                continue
+                                
+                            agent.score = sum(1 for row in self.world_map.grid for cell in row if cell.owner_id == agent.name)
                             
-                        # Очки за территории
-                        agent.score = sum(1 for row in self.world_map.grid for cell in row if cell.owner_id == agent.name)
-                        
-                        # Доход от захваченных шахт
-                        matter_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Matter')
-                        energy_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Energy')
-                        imag_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Imagination')
-                        
-                        agent.balance["matter"] += matter_mines * 10
-                        agent.balance["energy"] += energy_mines * 10
-                        agent.balance["imagination"] += imag_mines * 10
-                        
-                        # Налог на существование (Голод)
-                        agent.balance["energy"] -= 5
-                        
-                        if agent.balance["energy"] <= 0:
-                            agent.balance["energy"] = 0
-                            agent.is_dead = True
-                            self.add_log("TICK", f"💀 {agent.name} ПОГИБ ОТ ГОЛОДА (0 Энергии)!")
-                            continue
+                            matter_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Matter')
+                            energy_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Energy')
+                            imag_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Imagination')
                             
-                        # Проверка на победу (Сингулярность)
-                        if agent.balance["matter"] >= 5000 and agent.balance["energy"] >= 5000 and agent.balance["imagination"] >= 5000:
-                            self.add_log("TICK", f"🏆 {agent.name} ДОСТИГ ТЕХНОЛОГИЧЕСКОЙ СИНГУЛЯРНОСТИ И ПОБЕДИЛ!")
-                            self.started = False
-                            break
+                            agent.balance["matter"] += matter_mines * 10
+                            agent.balance["energy"] += energy_mines * 10
+                            agent.balance["imagination"] += imag_mines * 10
                             
-                        # Проверка на победу (Монополия)
-                        agent_mines = matter_mines + energy_mines + imag_mines
-                        if total_mines > 0 and (agent_mines / total_mines) >= 0.8:
-                            self.add_log("TICK", f"🏆 {agent.name} ДОСТИГ АБСОЛЮТНОЙ МОНОПОЛИИ (80% шахт) И ПОБЕДИЛ!")
-                            self.started = False
-                            break
-                    
-                    # Проверка на победу (Battle Royale)
-                    alive_now = [a for a in self.agents if not a.is_dead]
-                    if len(alive_now) == 1 and len(self.agents) > 1:
-                        self.add_log("TICK", f"👑 {alive_now[0].name} УНИЧТОЖИЛ ВСЕХ И ПОБЕДИЛ В BATTLE ROYALE!")
-                        self.started = False
-                    elif len(alive_now) == 0 and len(self.agents) > 0:
-                        self.add_log("TICK", "💀 ВСЕ АГЕНТЫ ПОГИБЛИ. КОНЕЦ ИГРЫ.")
-                        self.started = False
-                        
-                    if not self.started:
-                        for task in self.tasks: task.cancel()
-                        self.tasks.clear()
+                            agent.balance["energy"] -= 5
+                            if agent.balance["energy"] <= 0:
+                                agent.balance["energy"] = 0
+                                if not agent.is_dead:
+                                    agent.is_dead = True
+                                    agent.respawn_timer = 5
+                                    self.add_log("TICK", f"💀 {agent.name} ПОГИБ ОТ ГОЛОДА!")
+                                    logging.info(f"[{agent.name}] 💀 ПОГИБ ОТ ГОЛОДА!")
+                                    
+                                    # Выпадение лута
+                                    c = self.world_map.get_cell(agent.position.x, agent.position.y)
+                                    if c:
+                                        for res in ['matter', 'energy', 'imagination']:
+                                            c.loot[res] = c.loot.get(res, 0) + agent.balance[res]
+                                            agent.balance[res] = 0
+                                continue
+                                
+                            if agent.balance["matter"] >= 5000 and agent.balance["energy"] >= 5000 and agent.balance["imagination"] >= 5000:
+                                self.add_log("TICK", f"🏆 {agent.name} ДОСТИГ ТЕХНОЛОГИЧЕСКОЙ СИНГУЛЯРНОСТИ И ПОБЕДИЛ!")
+                                logging.info(f"🏆 {agent.name} ДОСТИГ ТЕХНОЛОГИЧЕСКОЙ СИНГУЛЯРНОСТИ И ПОБЕДИЛ!")
+                                self.started = False
+                                break
+                                
+                            agent_mines = matter_mines + energy_mines + imag_mines
+                            if total_mines > 0 and (agent_mines / total_mines) >= 0.8:
+                                self.add_log("TICK", f"🏆 {agent.name} ДОСТИГ АБСОЛЮТНОЙ МОНОПОЛИИ (80% шахт) И ПОБЕДИЛ!")
+                                logging.info(f"🏆 {agent.name} ДОСТИГ АБСОЛЮТНОЙ МОНОПОЛИИ (80% шахт) И ПОБЕДИЛ!")
+                                self.started = False
+                                break
+                        if not self.started:
+                            for task in self.tasks: task.cancel()
+                            self.tasks.clear()
+            except Exception as e:
+                logging.error(f"Tick Loop Error: {e}")
             await asyncio.sleep(2.0)
 
     def add_log(self, level, message):
@@ -183,7 +190,7 @@ def get_state():
             })
         grid_data.append(row)
         
-    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead} for a in web_state.agents]
+    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0)} for a in web_state.agents]
     
     return jsonify({
         "started": True,
@@ -352,7 +359,7 @@ HTML_TEMPLATE = """
             const sidebar = document.getElementById('sidebar');
             sidebar.innerHTML = agents.map(a => {
                 const color = a.is_dead ? '#475569' : stringToColor(a.name);
-                const title = a.is_dead ? `💀 ${a.name} (МЕРТВ)` : `🤖 ${a.name}`;
+                const title = a.is_dead ? `💀 ${a.name} (МЕРТВ, ${a.respawn_timer}с)` : `🤖 ${a.name} (HP: ${a.hp})`;
                 return `
                 <div class="agent-card" style="border-left: 4px solid ${color}; opacity: ${a.is_dead ? 0.6 : 1}">
                     <h3 style="color: ${color}">${title}</h3>
