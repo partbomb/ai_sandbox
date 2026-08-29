@@ -98,7 +98,7 @@ class WebState:
                             self.tasks.clear()
             except Exception as e:
                 logging.error(f"Tick Loop Error: {e}")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(15.0)
 
     def add_log(self, level, message):
 

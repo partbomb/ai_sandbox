@@ -120,7 +120,7 @@ class Stage2AI:
         self.client = genai.Client(api_key=self.api_key) if self.api_key and not self.api_key.startswith("sk-") and "test" not in self.api_key.lower() else None
 
     def generate_prompt(self, map_core: MapCore) -> str:
-        surroundings = map_core.get_map_state_json(self.position.x, self.position.y, radius=2)
+        surroundings = map_core.get_map_state_json()
         prompt = (
             f"You are AI Agent '{self.name}' on a 10x10 map (X:0-9, Y:0-9).\n"
             f"Your position: X:{self.position.x}, Y:{self.position.y}. HP: {self.hp}/100.\n"
@@ -137,7 +137,7 @@ class Stage2AI:
             f"- BUILD (Cost: 20 Matter): Builds a Wall on an adjacent cell to block movement.\n"
             f"- CAPTURE (Cost: 10 Imagination): Reprograms a mine to give you passive income. Requires cell to be clear of enemies/walls.\n"
             f"MAP BOUNDARIES: DO NOT move outside 0-9! If you are at Y=0, you CANNOT move N. If Y=9, you CANNOT move S. If X=0, you CANNOT move W. If X=9, you CANNOT move E.\n"
-            f"Surrounding cells (radius 2):\n{surroundings}\n\n"
+            f"Full Map state:\n{surroundings}\n\n"
             f"Available actions (return strictly JSON):\n"
             f"1. MOVE: {{\"action\": \"MOVE\", \"params\": {{\"direction\": \"N\"}}}} (N, S, E, W)\n"
             f"2. ATTACK: {{\"action\": \"ATTACK\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}\n"
@@ -322,7 +322,7 @@ async def map_render_loop(map_core: MapCore, agents: List[Stage2AI]):
             scores = " | ".join([f"{a.name}: {a.score} очков" for a in agents])
             logger.info(f"Счет -> {scores}")
             
-        await asyncio.sleep(2.0) # Отрисовка каждые 2 секунды
+        await asyncio.sleep(15.0) # Отрисовка каждые 15 секунд
 
 async def agent_loop(agent: Stage2AI, map_core: MapCore, arbiter: ArbitorPhysical, all_agents: List[Stage2AI]):
     """Жизненный цикл отдельного агента. Работает независимо от других."""
@@ -347,11 +347,11 @@ async def agent_loop(agent: Stage2AI, map_core: MapCore, arbiter: ArbitorPhysica
             if len(agent.memory) > 10:
                 agent.memory = agent.memory[-10:]
             
-            # Ускоряем время ожидания для быстрого отклика
-            await asyncio.sleep(2.5) 
+            # Увеличиваем задержку, чтобы не упираться в Rate Limit (15 RPM)
+            await asyncio.sleep(15.0) 
         except Exception as e:
             logger.error(f"[{agent.name}] LOOP CRASHED: {e}")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(10.0)
 
 async def main_simulation():
     logger.info("=== ЗАПУСК АСИНХРОННОЙ ФАЗЫ 2 (REAL-TIME) ===")

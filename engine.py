@@ -59,7 +59,7 @@ PROMPT_STAGE1 = (
     "You are an AI in a simulation. Your ULTIMATE GOAL is to reach Technological Singularity! "
     "To win, you must build the 'Server Core', which requires 5000 Matter, 5000 Energy, and 5000 Imagination.\n"
     "WARNING (HUNGER): You automatically lose 15 Energy every turn just to survive! If your Energy drops below 0, you DIE and drop all resources!\n"
-    "You are on a 5x5 Map (coordinates X: 0-4, Y: 0-4), but you only see a radius of 2 around your Avatar. "
+    "You are on a 5x5 Map (coordinates X: 0-4, Y: 0-4) and you can see the entire map. "
     "You must return ONLY a single JSON object. Put your reasoning in 'thoughts'.\n"
     "Available actions (CHOOSE ONLY ONE):\n"
     "1. Move (Costs 10 Energy. You can ONLY move to an adjacent cell or stay, distance <= 1): {\"thoughts\": \"...\", \"action\": \"move\", \"target_x\": <x>, \"target_y\": <y>}\n"
@@ -354,7 +354,7 @@ class Stage1AI:
 
     def generate_prompt(self, map_core: Optional['world.MapCore'] = None) -> str:
         """Промпт"""    
-        map_info = f"Map State: {map_core.get_map_state_json(self.state.x, self.state.y, 2)}\n" if map_core else ""
+        map_info = f"Map State: {map_core.get_map_state_json()}\n" if hasattr(map_core, 'get_map_state_json') else ""
         prompt = (
             f"{PROMPT_STAGE1}\n"
             f"Текущий статус:\n"
