@@ -60,9 +60,11 @@ class WebState:
                             energy_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Energy')
                             imag_mines = sum(1 for row in self.world_map.grid for c in row if c.owner_id == agent.name and c.resource_type == 'Imagination')
                             
-                            agent.balance["matter"] += matter_mines * 10
-                            agent.balance["energy"] += energy_mines * 10
-                            agent.balance["imagination"] += imag_mines * 10
+                            income_base = 12 if "economy_lvl_2" in agent.unlocked_techs else 10
+                            
+                            agent.balance["matter"] += matter_mines * income_base
+                            agent.balance["energy"] += energy_mines * income_base
+                            agent.balance["imagination"] += imag_mines * income_base
                             
                             agent.balance["energy"] -= 5
                             if agent.balance["energy"] <= 0:
@@ -190,7 +192,7 @@ def get_state():
             })
         grid_data.append(row)
         
-    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0)} for a in web_state.agents]
+    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0), "unlocked_techs": getattr(a, 'unlocked_techs', [])} for a in web_state.agents]
     
     return jsonify({
         "started": True,
@@ -301,6 +303,15 @@ HTML_TEMPLATE = """
 
     <script>
         let isStarted = false;
+        let lastAgentsData = [];
+        const expandedCards = {};
+
+        function toggleTechs(agentName) {
+            expandedCards[agentName] = !expandedCards[agentName];
+            if (lastAgentsData.length > 0) {
+                renderAgents(lastAgentsData);
+            }
+        }
 
         async function init() {
             try {
@@ -334,6 +345,7 @@ HTML_TEMPLATE = """
                 
                 if(data.started) {
                     document.getElementById('tickCounter').innerText = `⏱️ ТИК: ${data.tick}`;
+                    lastAgentsData = data.agents;
                     renderAgents(data.agents);
                     renderMap(data.map);
                     renderLogs(data.logs);
@@ -360,13 +372,25 @@ HTML_TEMPLATE = """
             sidebar.innerHTML = agents.map(a => {
                 const color = a.is_dead ? '#475569' : stringToColor(a.name);
                 const title = a.is_dead ? `💀 ${a.name} (МЕРТВ, ${a.respawn_timer}с)` : `🤖 ${a.name} (HP: ${a.hp})`;
+                
+                const techsHtml = a.unlocked_techs && a.unlocked_techs.length > 0 
+                    ? a.unlocked_techs.map(t => `<span style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-right: 4px; display: inline-block; margin-bottom: 4px;">${t}</span>`).join('') 
+                    : '<span style="font-size: 10px; color: var(--text-muted);">Нет изученных технологий</span>';
+                
+                const displayStyle = expandedCards[a.name] ? 'block' : 'none';
+
                 return `
-                <div class="agent-card" style="border-left: 4px solid ${color}; opacity: ${a.is_dead ? 0.6 : 1}">
+                <div class="agent-card" style="border-left: 4px solid ${color}; opacity: ${a.is_dead ? 0.6 : 1}; cursor: pointer;" onclick="toggleTechs('${a.name}')">
                     <h3 style="color: ${color}">${title}</h3>
                     <div style="font-size: 14px;">Координаты: X:${a.x}, Y:${a.y}</div>
                     <div style="font-size: 12px; margin-top: 6px;">Ресурсы (до 5000):</div>
                     <div style="font-size: 11px;">M: ${a.balance.matter} | E: ${a.balance.energy} | I: ${a.balance.imagination}</div>
                     <div style="font-size: 14px; margin-top: 6px;">Счет (Клетки): <b>${a.score}</b></div>
+                    <div style="font-size: 10px; color: var(--text-muted); margin-top: 4px;">(Нажмите, чтобы увидеть скиллы)</div>
+                    <div style="display: ${displayStyle}; margin-top: 8px; border-top: 1px solid var(--card-border); padding-top: 8px;">
+                        <div style="font-size: 12px; margin-bottom: 4px;"><b>Изучено:</b></div>
+                        ${techsHtml}
+                    </div>
                 </div>
             `}).join('');
         }

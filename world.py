@@ -116,15 +116,55 @@ class Stage2AI:
         self.balance = {"matter": 50, "energy": 50, "imagination": 50}
         self.income = init_income
         self.memory = []
+        self.unlocked_techs = []
 
         self.client = genai.Client(api_key=self.api_key) if self.api_key and not self.api_key.startswith("sk-") and "test" not in self.api_key.lower() else None
 
     def generate_prompt(self, map_core: MapCore) -> str:
         surroundings = map_core.get_map_state_json()
+        
+        TECH_TREE = {
+            "combat_lvl_1": {"cost": 150, "parent": None},
+            "combat_lvl_2": {"cost": 500, "parent": "combat_lvl_1"},
+            "combat_lvl_3": {"cost": 1500, "parent": "combat_lvl_2"},
+            "economy_lvl_1": {"cost": 150, "parent": None},
+            "economy_lvl_2": {"cost": 500, "parent": "economy_lvl_1"},
+            "economy_lvl_3": {"cost": 1500, "parent": "economy_lvl_2"},
+            "logistics_lvl_1": {"cost": 150, "parent": None},
+            "logistics_lvl_2": {"cost": 500, "parent": "logistics_lvl_1"},
+            "logistics_lvl_3": {"cost": 1500, "parent": "logistics_lvl_2"}
+        }
+        
+        available_techs = []
+        for tech, data in TECH_TREE.items():
+            if tech not in self.unlocked_techs:
+                if data["parent"] is None or data["parent"] in self.unlocked_techs:
+                    available_techs.append({"name": tech, "cost": data["cost"]})
+        
+        tech_status = f'"unlocked_techs": {json.dumps(self.unlocked_techs)},\n"available_techs": {json.dumps(available_techs)}'
+        
+        move_cost = 2 if "logistics_lvl_1" in self.unlocked_techs else 5
+        attack_dmg = 40 if "combat_lvl_1" in self.unlocked_techs else 25
+        build_cost = 14 if "economy_lvl_1" in self.unlocked_techs else 20
+        
+        actions_str = (
+            f"1. MOVE: {{\"action\": \"MOVE\", \"params\": {{\"direction\": \"N\"}}}} (N, S, E, W). Cost: {move_cost} Energy.\n"
+            f"2. ATTACK: {{\"action\": \"ATTACK\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}. Cost: 5 Energy. DMG: {attack_dmg}.\n"
+            f"3. BUILD: {{\"action\": \"BUILD\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}. Cost: {build_cost} Matter. Builds Wall.\n"
+            f"4. CAPTURE: {{\"action\": \"CAPTURE\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}. Cost: 10 Imagination. Captures Mine.\n"
+            f"5. RESEARCH: {{\"action\": \"RESEARCH\", \"params\": {{\"tech\": \"tech_name\"}}}}. Spends Imagination to unlock tech.\n"
+        )
+        if "economy_lvl_3" in self.unlocked_techs:
+            actions_str += f"6. BUILD_MINE: {{\"action\": \"BUILD_MINE\", \"params\": {{\"target_x\": X, \"target_y\": Y, \"type\": \"Matter\"}}}} (type: Matter/Energy/Imagination). Cost: 50 Matter, 50 Energy. Creates mine on empty cell.\n"
+        if "logistics_lvl_3" in self.unlocked_techs:
+            actions_str += f"7. JUMP: {{\"action\": \"JUMP\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}. Cost: 50 Energy. Teleports to any cell.\n"
+        actions_str += "8. PASS: {\"action\": \"PASS\"}\n"
+
         prompt = (
             f"You are AI Agent '{self.name}' on a 10x10 map (X:0-9, Y:0-9).\n"
             f"Your position: X:{self.position.x}, Y:{self.position.y}. HP: {self.hp}/100.\n"
             f"Your balance: Matter={self.balance['matter']}, Energy={self.balance['energy']}, Imagination={self.balance['imagination']}.\n"
+            f"TECH STATUS:\n{tech_status}\n\n"
             f"MEMORY LOG (Last actions and results):\n"
             f"{chr(10).join(self.memory) if self.memory else 'No memories yet.'}\n\n"
             f"WIN CONDITIONS:\n"
@@ -132,18 +172,15 @@ class Stage2AI:
             f"2. Monopoly: Capture 80% of all resource mines.\n"
             f"3. Battle Royale: Kill all other agents.\n"
             f"RULES & MECHANICS:\n"
+            f"- SKILL TREE: Research techs using Imagination to get stronger (combat: dmg/wall HP/vampirism, economy: cheaper build/mine income/create mines, logistics: cheaper move/bonus loot/teleport).\n"
             f"- MOVE: Navigate the map. Blocked by Walls or Enemies. Loot is auto-picked up.\n"
-            f"- ATTACK (Cost: 5 Energy): Deals 25 damage. Targets: Enemies, Walls, or Mines. Drops Matter when breaking walls/mines.\n"
-            f"- BUILD (Cost: 20 Matter): Builds a Wall on an adjacent cell to block movement.\n"
-            f"- CAPTURE (Cost: 10 Imagination): Reprograms a mine to give you passive income. Requires cell to be clear of enemies/walls.\n"
+            f"- ATTACK: Deals damage. Targets: Enemies, Walls, or Mines. Drops Matter when breaking walls/mines.\n"
+            f"- BUILD: Builds a Wall on an adjacent cell to block movement.\n"
+            f"- CAPTURE: Reprograms a mine to give you passive income. Requires cell to be clear of enemies/walls.\n"
             f"MAP BOUNDARIES: DO NOT move outside 0-9! If you are at Y=0, you CANNOT move N. If Y=9, you CANNOT move S. If X=0, you CANNOT move W. If X=9, you CANNOT move E.\n"
             f"Full Map state:\n{surroundings}\n\n"
             f"Available actions (return strictly JSON):\n"
-            f"1. MOVE: {{\"action\": \"MOVE\", \"params\": {{\"direction\": \"N\"}}}} (N, S, E, W)\n"
-            f"2. ATTACK: {{\"action\": \"ATTACK\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}\n"
-            f"3. BUILD: {{\"action\": \"BUILD\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}\n"
-            f"4. CAPTURE: {{\"action\": \"CAPTURE\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}\n"
-            f"5. PASS: {{\"action\": \"PASS\"}}\n"
+            f"{actions_str}"
             f"THINK BEFORE YOU ACT. Add a 'thought' field in your JSON explaining your strategy.\n"
         )
         return prompt
@@ -199,7 +236,32 @@ class ArbitorPhysical:
             action = action_data.get("action", "PASS")
             params = action_data.get("params", {})
             
-            if action == "MOVE":
+            if action == "RESEARCH":
+                tech = params.get("tech")
+                TECH_TREE = {
+                    "combat_lvl_1": {"cost": 150, "parent": None}, "combat_lvl_2": {"cost": 500, "parent": "combat_lvl_1"}, "combat_lvl_3": {"cost": 1500, "parent": "combat_lvl_2"},
+                    "economy_lvl_1": {"cost": 150, "parent": None}, "economy_lvl_2": {"cost": 500, "parent": "economy_lvl_1"}, "economy_lvl_3": {"cost": 1500, "parent": "economy_lvl_2"},
+                    "logistics_lvl_1": {"cost": 150, "parent": None}, "logistics_lvl_2": {"cost": 500, "parent": "logistics_lvl_1"}, "logistics_lvl_3": {"cost": 1500, "parent": "logistics_lvl_2"}
+                }
+                if tech not in TECH_TREE:
+                    return f"Технология {tech} не существует."
+                if tech in avatar.unlocked_techs:
+                    return f"Технология {tech} уже изучена."
+                req_parent = TECH_TREE[tech]["parent"]
+                if req_parent and req_parent not in avatar.unlocked_techs:
+                    return f"Сначала нужно изучить {req_parent}."
+                cost = TECH_TREE[tech]["cost"]
+                if avatar.balance["imagination"] < cost:
+                    return f"Недостаточно Воображения (нужно {cost})."
+                avatar.balance["imagination"] -= cost
+                avatar.unlocked_techs.append(tech)
+                return f"УСПЕШНО ИЗУЧЕНО: {tech}!"
+
+            elif action == "MOVE":
+                move_cost = 2 if "logistics_lvl_1" in avatar.unlocked_techs else 5
+                if avatar.balance["energy"] < move_cost:
+                    return f"Недостаточно Энергии (нужно {move_cost}) для перемещения."
+                
                 direction = params.get("direction")
                 dx, dy = 0, 0
                 if direction == 'N': dy = -1
@@ -214,22 +276,43 @@ class ArbitorPhysical:
                     if enemy_here:
                         return f"Движение заблокировано врагом {enemy_here.name}."
                         
+                    avatar.balance["energy"] -= move_cost
                     avatar.position = Position(x=new_x, y=new_y)
                     pickup_msg = ""
+                    loot_mult = 1.5 if "logistics_lvl_2" in avatar.unlocked_techs else 1.0
                     for res in ['matter', 'energy', 'imagination']:
                         if target_cell.loot.get(res, 0) > 0:
-                            amt = target_cell.loot[res]
+                            amt = int(target_cell.loot[res] * loot_mult)
                             avatar.balance[res] += amt
                             target_cell.loot[res] = 0
                             pickup_msg += f" Подобрано {amt} {res}."
                     return f"Переместился на {direction} ({new_x}, {new_y})." + pickup_msg
                 return "Стена или край карты."
 
+            elif action == "JUMP":
+                if "logistics_lvl_3" not in avatar.unlocked_techs:
+                    return "Команда JUMP недоступна (нужен logistics_lvl_3)."
+                if avatar.balance["energy"] < 50:
+                    return "Недостаточно Энергии (нужно 50) для прыжка."
+                
+                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                target_cell = map_core.get_cell(tx, ty)
+                if not target_cell or target_cell.structure == 'Wall':
+                    return "Нельзя прыгнуть сюда (стена или край карты)."
+                enemy_here = next((a for a in all_agents if a.position.x == tx and a.position.y == ty and a.name != avatar.name and not a.is_dead), None)
+                if enemy_here:
+                    return "Нельзя прыгнуть: клетка занята врагом."
+                
+                avatar.balance["energy"] -= 50
+                avatar.position = Position(x=tx, y=ty)
+                return f"ТЕЛЕПОРТАЦИЯ на ({tx}, {ty}) прошла успешно!"
+
             elif action == "ATTACK":
                 if avatar.balance["energy"] < 5:
                     return "Недостаточно Энергии (Нужно 5) для атаки."
                 avatar.balance["energy"] -= 5
                 
+                dmg = 40 if "combat_lvl_1" in avatar.unlocked_techs else 25
                 tx, ty = params.get("target_x", -1), params.get("target_y", -1)
                 if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)) and not (avatar.position.x == tx and avatar.position.y == ty):
                     return "Цель вне зоны досягаемости."
@@ -238,7 +321,7 @@ class ArbitorPhysical:
                 enemy = next((a for a in all_agents if a.position.x == tx and a.position.y == ty and a.name != avatar.name and not a.is_dead), None)
                 
                 if enemy:
-                    enemy.hp -= 25
+                    enemy.hp -= dmg
                     if enemy.hp <= 0:
                         enemy.is_dead = True
                         enemy.respawn_timer = 5
@@ -246,20 +329,25 @@ class ArbitorPhysical:
                             target_cell.loot[res] = target_cell.loot.get(res, 0) + enemy.balance[res]
                             enemy.balance[res] = 0
                         return f"УСПЕШНО АТАКОВАЛ И УБИЛ {enemy.name} на ({tx}, {ty})!"
-                    return f"Нанес 25 урона {enemy.name}. Осталось HP: {enemy.hp}."
+                    return f"Нанес {dmg} урона {enemy.name}. Осталось HP: {enemy.hp}."
                 elif target_cell and target_cell.structure == 'Wall':
-                    target_cell.wall_hp -= 25
+                    target_cell.wall_hp -= dmg
                     avatar.balance["matter"] += 2
                     if target_cell.wall_hp <= 0:
                         target_cell.structure = None
-                        return "Стена разрушена! Получено 2 Материи."
+                        return f"Стена разрушена! Получено 2 Материи."
                     return f"Удар по стене. Осталось HP: {target_cell.wall_hp}."
                 elif target_cell and target_cell.resource_type:
-                    target_cell.mine_hp -= 25
+                    target_cell.mine_hp -= dmg
                     avatar.balance["matter"] += 5
                     if target_cell.mine_hp <= 0:
                         target_cell.resource_type = None
                         target_cell.owner_id = None
+                        if "combat_lvl_3" in avatar.unlocked_techs:
+                            avatar.balance["matter"] += 50
+                            avatar.balance["energy"] += 50
+                            avatar.balance["imagination"] += 50
+                            return "Шахта полностью разрушена! ВАМПИРИЗМ: получено по 50 всех ресурсов."
                         return "Шахта полностью разрушена! Получено 5 Материи."
                     return f"Удар по шахте. Осталось HP: {target_cell.mine_hp}."
                 else:
@@ -269,8 +357,10 @@ class ArbitorPhysical:
                 tx, ty = params.get("target_x", -1), params.get("target_y", -1)
                 if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)):
                     return "Цель вне зоны досягаемости."
-                if avatar.balance["matter"] < 20:
-                    return "Недостаточно Материи (нужно 20) для постройки стены."
+                
+                build_cost = 14 if "economy_lvl_1" in avatar.unlocked_techs else 20
+                if avatar.balance["matter"] < build_cost:
+                    return f"Недостаточно Материи (нужно {build_cost}) для постройки стены."
                 target_cell = map_core.get_cell(tx, ty)
                 if not target_cell or target_cell.structure == 'Wall':
                     return "Здесь уже есть постройка или край карты."
@@ -278,10 +368,37 @@ class ArbitorPhysical:
                 enemy_here = any(a.position.x == tx and a.position.y == ty and not a.is_dead for a in all_agents)
                 if enemy_here: return "Невозможно строить: на клетке кто-то стоит."
                 
-                avatar.balance["matter"] -= 20
+                avatar.balance["matter"] -= build_cost
                 target_cell.structure = 'Wall'
-                target_cell.wall_hp = 100
-                return "Стена успешно построена."
+                target_cell.wall_hp = 250 if "combat_lvl_2" in avatar.unlocked_techs else 100
+                return f"Стена успешно построена (HP: {target_cell.wall_hp})."
+
+            elif action == "BUILD_MINE":
+                if "economy_lvl_3" not in avatar.unlocked_techs:
+                    return "Команда BUILD_MINE недоступна (нужен economy_lvl_3)."
+                if avatar.balance["matter"] < 50 or avatar.balance["energy"] < 50:
+                    return "Недостаточно ресурсов (нужно 50 Matter, 50 Energy)."
+                    
+                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                mine_type = params.get("type", "Matter")
+                if mine_type not in ["Matter", "Energy", "Imagination"]:
+                    mine_type = "Matter"
+                    
+                if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)) and not (avatar.position.x == tx and avatar.position.y == ty):
+                    return "Цель вне зоны досягаемости."
+                
+                target_cell = map_core.get_cell(tx, ty)
+                if not target_cell or target_cell.structure or target_cell.resource_type:
+                    return "Клетка занята стеной, шахтой или край карты."
+                    
+                avatar.balance["matter"] -= 50
+                avatar.balance["energy"] -= 50
+                
+                target_cell.resource_type = mine_type
+                target_cell.mine_level = 1
+                target_cell.mine_hp = 50
+                target_cell.owner_id = avatar.name
+                return f"Шахта ({mine_type}) успешно создана на ({tx}, {ty})!"
 
             elif action == "CAPTURE":
                 if avatar.balance["imagination"] < 10:
