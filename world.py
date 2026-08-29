@@ -103,7 +103,7 @@ class MapCore:
 # --- Расширение для Агента (Единственный Аватар) ---
 
 class Stage2AI: 
-    def __init__(self, name: str, api_key: str, model: str, start_pos: Position, init_income: dict):
+    def __init__(self, name: str, api_key: str, model: str, start_pos: Position, init_income: dict, is_human: bool = False):
         self.name = name
         self.api_key = api_key
         self.model = model
@@ -117,8 +117,13 @@ class Stage2AI:
         self.income = init_income
         self.memory = []
         self.unlocked_techs = []
+        
+        self.is_human = is_human
+        self.human_action = None
+        self.human_prompt = ""
+        self.human_ready = asyncio.Event()
 
-        self.client = genai.Client(api_key=self.api_key) if self.api_key and not self.api_key.startswith("sk-") and "test" not in self.api_key.lower() else None
+        self.client = genai.Client(api_key=self.api_key) if self.api_key and not self.api_key.startswith("sk-") and "test" not in self.api_key.lower() and not self.is_human else None
 
     def generate_prompt(self, map_core: MapCore) -> str:
         surroundings = map_core.get_map_state_json()
@@ -188,6 +193,20 @@ class Stage2AI:
     async def get_action_from_llm(self, map_core: MapCore) -> dict:
         prompt = self.generate_prompt(map_core)
         
+        if getattr(self, 'is_human', False):
+            self.human_prompt = prompt
+            self.human_action = None
+            self.human_ready.clear()
+            try:
+                # Даем человеку 60 секунд на ход
+                await asyncio.wait_for(self.human_ready.wait(), timeout=60.0)
+                if self.human_action:
+                    return self.human_action
+                return {"action": "PASS"}
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self.name}] Человек не успел сходить. Пропуск хода.")
+                return {"action": "PASS"}
+
         if not self.api_key or self.api_key.startswith("sk-") or "test" in self.api_key.lower():
             await asyncio.sleep(0.5) 
             return {"action": "PASS"}

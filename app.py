@@ -4,7 +4,7 @@ import threading
 import asyncio
 import time
 from typing import List
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 import world
 
 app = Flask(__name__)
@@ -132,6 +132,8 @@ logging.getLogger("WorldMap").addHandler(WebLogHandler())
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
+    req = request.get_json(silent=True) or {}
+    mode = req.get("mode", "ai_only")
     try:
         with open("agents_config.json", "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -145,6 +147,11 @@ def api_start():
     
     import random
     web_state.agents = []
+    
+    if mode == "with_human":
+        pos = world.Position(x=random.randint(0, 9), y=random.randint(0, 9))
+        human = world.Stage2AI("Human-Player", "", "", pos, {"matter": 10, "energy": 10, "imagination": 10}, is_human=True)
+        web_state.agents.append(human)
     
     # Динамическая загрузка всех агентов
     for agent_data in data.get("agents", []):
@@ -201,6 +208,23 @@ def get_state():
         "agents": agents_data,
         "logs": web_state.logs
     })
+
+@app.route('/api/human_prompt', methods=['GET'])
+def get_human_prompt():
+    human = next((a for a in web_state.agents if getattr(a, 'is_human', False)), None)
+    if human and not human.human_ready.is_set() and not human.is_dead:
+        return jsonify({"has_turn": True, "prompt": human.human_prompt})
+    return jsonify({"has_turn": False})
+
+@app.route('/api/human_action', methods=['POST'])
+def post_human_action():
+    human = next((a for a in web_state.agents if getattr(a, 'is_human', False)), None)
+    if human:
+        data = request.get_json(silent=True)
+        human.human_action = data
+        human.human_ready.set()
+        return jsonify({"success": True})
+    return jsonify({"success": False})
 
 
 # --- WEB UI ---
@@ -286,7 +310,8 @@ HTML_TEMPLATE = """
         <div style="font-size: 20px; font-weight: 700; color: var(--accent-cyan);">🤖 AI Sandbox - Phase 2 (Async Grid)</div>
         <div style="display: flex; gap: 16px; align-items: center;">
             <div id="tickCounter" style="font-weight: 600; color: #f59e0b; display: none;">⏱️ ТИК: 0</div>
-            <button class="start-btn" onclick="startSim()" id="startBtn">ЗАПУСТИТЬ СИМУЛЯЦИЮ</button>
+            <button class="start-btn" onclick="startSim('ai_only')" id="startBtnAI">ЗАПУСК (ТОЛЬКО ИИ)</button>
+            <button class="start-btn" style="background: linear-gradient(135deg, #10b981, #059669);" onclick="startSim('with_human')" id="startBtnHuman">ЗАПУСК (С ЧЕЛОВЕКОМ)</button>
         </div>
     </header>
 
@@ -301,8 +326,29 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
+    <div id="humanPanel" style="display: none; position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--card-bg); border: 1px solid var(--accent-cyan); padding: 15px; border-radius: 12px; z-index: 100; box-shadow: 0 0 20px rgba(6, 182, 212, 0.3); width: 800px; backdrop-filter: blur(10px);">
+        <h3 style="color: var(--accent-cyan); margin-bottom: 10px;">🎮 ВАШ ХОД! (У вас 60 секунд)</h3>
+        <textarea id="humanPromptText" style="width: 100%; height: 180px; background: rgba(0,0,0,0.5); color: #fff; border: 1px solid var(--card-border); font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 10px; margin-bottom: 10px;" readonly></textarea>
+        <div style="display: flex; gap: 10px; align-items: center;">
+            <input type="text" id="humanActionInput" placeholder='{"action": "MOVE", "params": {"direction": "N"}}' style="flex: 1; padding: 10px; background: rgba(0,0,0,0.5); color: #fff; border: 1px solid var(--card-border); font-family: monospace;">
+            <button onclick="sendHumanAction()" class="start-btn">ОТПРАВИТЬ ХОД</button>
+        </div>
+        <div style="display: flex; gap: 5px; margin-top: 10px; flex-wrap: wrap;">
+            <button onclick="fillAction('MOVE', {direction:'N'})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">MOVE N</button>
+            <button onclick="fillAction('MOVE', {direction:'S'})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">MOVE S</button>
+            <button onclick="fillAction('MOVE', {direction:'E'})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">MOVE E</button>
+            <button onclick="fillAction('MOVE', {direction:'W'})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">MOVE W</button>
+            <button onclick="fillAction('CAPTURE', {target_x:0, target_y:0})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">CAPTURE (0,0)</button>
+            <button onclick="fillAction('ATTACK', {target_x:0, target_y:0})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">ATTACK (0,0)</button>
+            <button onclick="fillAction('BUILD', {target_x:0, target_y:0})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">BUILD (0,0)</button>
+            <button onclick="fillAction('RESEARCH', {tech:'combat_lvl_1'})" style="padding:5px; background: #8b5cf6; color: white; border: none; cursor: pointer; border-radius: 4px;">RESEARCH</button>
+            <button onclick="fillAction('PASS', {})" style="padding:5px; background: #64748b; color: white; border: none; cursor: pointer; border-radius: 4px;">PASS</button>
+        </div>
+    </div>
+
     <script>
         let isStarted = false;
+        let isHumanMode = false;
         let lastAgentsData = [];
         const expandedCards = {};
 
@@ -319,22 +365,61 @@ HTML_TEMPLATE = """
                 const data = await res.json();
                 if(data.started) {
                     isStarted = true;
-                    document.getElementById('startBtn').style.display = 'none';
+                    document.getElementById('startBtnAI').style.display = 'none';
+                    document.getElementById('startBtnHuman').style.display = 'none';
                     document.getElementById('tickCounter').style.display = 'block';
                     document.getElementById('mainLayout').style.display = 'flex';
                     fetchStateLoop();
+                    humanLoop();
                 }
             } catch(e) {}
         }
 
-        async function startSim() {
-            document.getElementById('startBtn').innerText = "Запускается...";
-            await fetch('/api/start', { method: 'POST' });
+        async function startSim(mode) {
+            document.getElementById('startBtnAI').style.display = 'none';
+            document.getElementById('startBtnHuman').style.display = 'none';
+            await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: mode}) });
             isStarted = true;
-            document.getElementById('startBtn').style.display = 'none';
+            isHumanMode = (mode === 'with_human');
             document.getElementById('tickCounter').style.display = 'block';
             document.getElementById('mainLayout').style.display = 'flex';
             fetchStateLoop();
+            if (isHumanMode) humanLoop();
+        }
+        
+        async function humanLoop() {
+            if (!isStarted) return;
+            try {
+                const res = await fetch('/api/human_prompt');
+                const data = await res.json();
+                if(data.has_turn) {
+                    document.getElementById('humanPanel').style.display = 'block';
+                    document.getElementById('humanPromptText').value = data.prompt;
+                } else {
+                    document.getElementById('humanPanel').style.display = 'none';
+                }
+            } catch(e) {}
+            setTimeout(humanLoop, 1000);
+        }
+
+        function fillAction(act, params) {
+            document.getElementById('humanActionInput').value = JSON.stringify({action: act, params: params});
+        }
+
+        async function sendHumanAction() {
+            const val = document.getElementById('humanActionInput').value;
+            try {
+                const actionObj = JSON.parse(val);
+                await fetch('/api/human_action', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: val
+                });
+                document.getElementById('humanPanel').style.display = 'none';
+                document.getElementById('humanActionInput').value = '';
+            } catch(e) {
+                alert("Неверный формат JSON!");
+            }
         }
 
         async function fetchStateLoop() {
