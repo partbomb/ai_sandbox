@@ -479,7 +479,7 @@ async def map_render_loop(map_core: MapCore, agents: List[Stage2AI]):
             scores = " | ".join([f"{a.name}: {a.score} очков" for a in agents])
             logger.info(f"Счет -> {scores}")
             
-        await asyncio.sleep(15.0) # Отрисовка каждые 15 секунд
+        await asyncio.sleep(4.3) # Отрисовка каждые 4.3 секунды (~14 тиков в минуту)
 
 async def agent_loop(agent: Stage2AI, map_core: MapCore, arbiter: ArbitorPhysical, all_agents: List[Stage2AI]):
     """Жизненный цикл отдельного агента. Работает независимо от других."""
@@ -521,8 +521,8 @@ async def agent_loop(agent: Stage2AI, map_core: MapCore, arbiter: ArbitorPhysica
             if len(agent.memory) > 10:
                 agent.memory = agent.memory[-10:]
 
-            # Увеличиваем задержку, чтобы не упираться в Rate Limit (15 RPM)
-            await asyncio.sleep(15.0)
+            # Настройка задержки под ~14 RPM (60 / 14 = 4.28 с)
+            await asyncio.sleep(4.3)
         except Exception as e:
             logger.error(f"[{agent.name}] LOOP CRASHED: {e}")
             await asyncio.sleep(10.0)
