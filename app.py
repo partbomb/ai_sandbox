@@ -199,7 +199,7 @@ def get_state():
             })
         grid_data.append(row)
         
-    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0), "unlocked_techs": getattr(a, 'unlocked_techs', [])} for a in web_state.agents]
+    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0), "unlocked_techs": getattr(a, 'unlocked_techs', []), "short_term_memory": getattr(a, 'short_term_memory', []), "long_term_memory": getattr(a, 'long_term_memory', '')} for a in web_state.agents]
     
     return jsonify({
         "started": True,
@@ -457,21 +457,43 @@ HTML_TEMPLATE = """
             sidebar.innerHTML = agents.map(a => {
                 const color = a.is_dead ? '#475569' : stringToColor(a.name);
                 const title = a.is_dead ? `💀 ${a.name} (МЕРТВ, ${a.respawn_timer}с)` : `🤖 ${a.name} (HP: ${a.hp})`;
-                
-                const techsHtml = a.unlocked_techs && a.unlocked_techs.length > 0 
-                    ? a.unlocked_techs.map(t => `<span style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-right: 4px; display: inline-block; margin-bottom: 4px;">${t}</span>`).join('') 
+
+                // Strategic Compass (long-term memory)
+                const compassText = (a.long_term_memory && a.long_term_memory.trim()) ? a.long_term_memory : 'Нет данных.';
+
+                // Mission Log (short-term memory, max 4 entries)
+                const stmLines = (a.short_term_memory && a.short_term_memory.length > 0)
+                    ? a.short_term_memory.map((line, i) =>
+                        `<div style="padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 10px; color: #94a3b8;"><span style="color:#f59e0b; font-weight:700;">${i+1}.</span> ${line}</div>`
+                      ).join('')
+                    : '<div style="font-size:10px;color:#475569;">Журнал пуст.</div>';
+
+                // Tech tree
+                const techsHtml = a.unlocked_techs && a.unlocked_techs.length > 0
+                    ? a.unlocked_techs.map(t => `<span style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-right: 4px; display: inline-block; margin-bottom: 4px;">${t}</span>`).join('')
                     : '<span style="font-size: 10px; color: var(--text-muted);">Нет изученных технологий</span>';
-                
+
                 const displayStyle = expandedCards[a.name] ? 'block' : 'none';
 
                 return `
-                <div class="agent-card" style="border-left: 4px solid ${color}; opacity: ${a.is_dead ? 0.6 : 1}; cursor: pointer;" onclick="toggleTechs('${a.name}')">
+                <div class="agent-card" style="border-left: 4px solid ${color}; opacity: ${a.is_dead ? 0.6 : 1};">
                     <h3 style="color: ${color}">${title}</h3>
                     <div style="font-size: 14px;">Координаты: X:${a.x}, Y:${a.y}</div>
                     <div style="font-size: 12px; margin-top: 6px;">Ресурсы (до 5000):</div>
                     <div style="font-size: 11px;">M: ${a.balance.matter} | E: ${a.balance.energy} | I: ${a.balance.imagination}</div>
                     <div style="font-size: 14px; margin-top: 6px;">Счет (Клетки): <b>${a.score}</b></div>
-                    <div style="font-size: 10px; color: var(--text-muted); margin-top: 4px;">(Нажмите, чтобы увидеть скиллы)</div>
+
+                    <div style="margin-top: 10px; background: rgba(6,182,212,0.07); border: 1px solid rgba(6,182,212,0.25); border-radius: 8px; padding: 8px;">
+                        <div style="font-size: 10px; color: #06b6d4; font-weight: 700; margin-bottom: 4px;">🧭 СТРАТЕГИЧЕСКИЙ КОМПАС</div>
+                        <div style="font-size: 11px; color: #e2e8f0; font-style: italic; line-height: 1.4;">"${compassText}"</div>
+                    </div>
+
+                    <div style="margin-top: 8px; background: rgba(245,158,11,0.07); border: 1px solid rgba(245,158,11,0.25); border-radius: 8px; padding: 8px;">
+                        <div style="font-size: 10px; color: #f59e0b; font-weight: 700; margin-bottom: 4px;">📋 БОРТОВОЙ ЖУРНАЛ</div>
+                        ${stmLines}
+                    </div>
+
+                    <div style="font-size: 10px; color: var(--text-muted); margin-top: 8px; cursor: pointer;" onclick="toggleTechs('${a.name}')">(Нажмите, чтобы увидеть скиллы)</div>
                     <div style="display: ${displayStyle}; margin-top: 8px; border-top: 1px solid var(--card-border); padding-top: 8px;">
                         <div style="font-size: 12px; margin-bottom: 4px;"><b>Изучено:</b></div>
                         ${techsHtml}

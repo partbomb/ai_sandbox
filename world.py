@@ -115,9 +115,15 @@ class Stage2AI:
         self.respawn_timer = 0
         self.balance = {"matter": 50, "energy": 50, "imagination": 50}
         self.income = init_income
-        self.memory = []
+        self.memory = []  # legacy, kept for compatibility
         self.unlocked_techs = []
-        
+
+        # --- Dual Memory System ---
+        # Short-term: rolling log of last 4 actions ("Бортовой журнал")
+        self.short_term_memory: list[str] = []
+        # Long-term: strategic compass, agent rewrites each turn ("Стратегический компас")
+        self.long_term_memory: str = "Начало. Изучить карту и захватить ближайшую шахту."
+
         self.is_human = is_human
         self.human_action = None
         self.human_prompt = ""
@@ -165,28 +171,43 @@ class Stage2AI:
             actions_str += f"7. JUMP: {{\"action\": \"JUMP\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}. Cost: 50 Energy. Teleports to any cell.\n"
         actions_str += "8. PASS: {\"action\": \"PASS\"}\n"
 
+        # --- Build memory sections ---
+        # Short-term: last 4 actions (бортовой журнал)
+        stm_lines = self.short_term_memory if self.short_term_memory else ["Нет записей."]
+        stm_text = "\n".join(f"  {i+1}. {line}" for i, line in enumerate(stm_lines))
+
         prompt = (
-            f"You are AI Agent '{self.name}' on a 10x10 map (X:0-9, Y:0-9).\n"
-            f"Your position: X:{self.position.x}, Y:{self.position.y}. HP: {self.hp}/100.\n"
-            f"Your balance: Matter={self.balance['matter']}, Energy={self.balance['energy']}, Imagination={self.balance['imagination']}.\n"
+            f"=== ПАПКА С ДЕЛОМ (твой текущий контекст) ===\n\n"
+            f"[1] СТРАТЕГИЧЕСКИЙ КОМПАС (Долгосрочная цель):\n"
+            f"  '{self.long_term_memory}'\n\n"
+            f"[2] БОРТОВОЙ ЖУРНАЛ (Краткосрочная память, последние {len(stm_lines)} действий):\n"
+            f"{stm_text}\n\n"
+            f"[3] ТВОИ ГЛАЗА (Текущее состояние):\n"
+            f"  Имя: {self.name} | Позиция: X:{self.position.x}, Y:{self.position.y} | HP: {self.hp}/100\n"
+            f"  Баланс: Matter={self.balance['matter']}, Energy={self.balance['energy']}, Imagination={self.balance['imagination']}\n"
+            f"  Карта (10x10, X:0-9, Y:0-9):\n{surroundings}\n\n"
             f"TECH STATUS:\n{tech_status}\n\n"
-            f"MEMORY LOG (Last actions and results):\n"
-            f"{chr(10).join(self.memory) if self.memory else 'No memories yet.'}\n\n"
             f"WIN CONDITIONS:\n"
-            f"1. Singularity: 5000 of all resources.\n"
-            f"2. Monopoly: Capture 80% of all resource mines.\n"
-            f"3. Battle Royale: Kill all other agents.\n"
+            f"  1. Singularity: 5000 of all resources.\n"
+            f"  2. Monopoly: Capture 80% of all resource mines.\n"
+            f"  3. Battle Royale: Kill all other agents.\n\n"
             f"RULES & MECHANICS:\n"
-            f"- SKILL TREE: Research techs using Imagination to get stronger (combat: dmg/wall HP/vampirism, economy: cheaper build/mine income/create mines, logistics: cheaper move/bonus loot/teleport).\n"
+            f"- SKILL TREE: Research techs using Imagination.\n"
             f"- MOVE: Navigate the map. Blocked by Walls or Enemies. Loot is auto-picked up.\n"
-            f"- ATTACK: Deals damage. Targets: Enemies, Walls, or Mines. Drops Matter when breaking walls/mines.\n"
-            f"- BUILD: Builds a Wall on an adjacent cell to block movement.\n"
-            f"- CAPTURE: Reprograms a mine to give you passive income. Requires cell to be clear of enemies/walls.\n"
-            f"MAP BOUNDARIES: DO NOT move outside 0-9! If you are at Y=0, you CANNOT move N. If Y=9, you CANNOT move S. If X=0, you CANNOT move W. If X=9, you CANNOT move E.\n"
-            f"Full Map state:\n{surroundings}\n\n"
+            f"- ATTACK: Deals damage. Targets: Enemies, Walls, or Mines.\n"
+            f"- BUILD: Builds a Wall on an adjacent cell.\n"
+            f"- CAPTURE: Reprograms a mine. Requires cell to be clear of enemies/walls.\n"
+            f"MAP BOUNDARIES: DO NOT move outside 0-9! If at Y=0 cannot move N, Y=9 cannot move S, X=0 cannot move W, X=9 cannot move E.\n\n"
             f"Available actions (return strictly JSON):\n"
-            f"{actions_str}"
-            f"THINK BEFORE YOU ACT. Add a 'thought' field in your JSON explaining your strategy.\n"
+            f"{actions_str}\n"
+            f"=== ИНСТРУКЦИЯ ПО ОТВЕТУ ===\n"
+            f"Прочитай Компас -> Журнал -> Карту. Подумай: изменилась ли ситуация?\n"
+            f"Верни JSON с полями:\n"
+            f"  'thought'      — твой внутренний монолог (строка)\n"
+            f"  'action'       — выбранное действие\n"
+            f"  'params'       — параметры действия\n"
+            f"  'new_compass'  — обновлённый Компас (строка, 1-2 предложения). "
+            f"Если план не изменился — повтори текущий. Если ситуация изменилась — перепиши!\n"
         )
         return prompt
 
@@ -462,29 +483,46 @@ async def map_render_loop(map_core: MapCore, agents: List[Stage2AI]):
 
 async def agent_loop(agent: Stage2AI, map_core: MapCore, arbiter: ArbitorPhysical, all_agents: List[Stage2AI]):
     """Жизненный цикл отдельного агента. Работает независимо от других."""
+    turn_number = 0
     while True:
         try:
             if agent.is_dead:
                 await asyncio.sleep(2.0)
                 continue
-                
+
+            turn_number += 1
+
             # Агент думает (ждем ответа LLM)
             action_data = await agent.get_action_from_llm(map_core)
-            
+
             # Агент применяет действие к карте
             if agent.is_dead:
                 continue
             result = await arbiter.execute_action(agent, action_data, map_core, all_agents)
             logger.info(f"[{agent.name}] -> {action_data.get('action')} | {result}")
-            
-            # Сохраняем результат в память ИИ
+
+            # --- Обновление двухуровневой памяти ---
             action_name = action_data.get('action', 'UNKNOWN')
+
+            # Краткосрочная память: добавляем запись, стираем старую при 4+
+            journal_entry = f"Ход {turn_number}: {action_name} -> {result}"
+            agent.short_term_memory.append(journal_entry)
+            if len(agent.short_term_memory) > 4:
+                agent.short_term_memory.pop(0)  # удаляем самую старую запись
+
+            # Долгосрочная память: агент обновляет Компас, если вернул new_compass
+            new_compass = action_data.get('new_compass')
+            if new_compass and isinstance(new_compass, str) and new_compass.strip():
+                agent.long_term_memory = new_compass.strip()
+                logger.info(f"[{agent.name}] 🧭 КОМПАС ОБНОВЛЁН: {agent.long_term_memory}")
+
+            # Legacy memory (backward compat)
             agent.memory.append(f"- Used {action_name}: {result}")
             if len(agent.memory) > 10:
                 agent.memory = agent.memory[-10:]
-            
+
             # Увеличиваем задержку, чтобы не упираться в Rate Limit (15 RPM)
-            await asyncio.sleep(15.0) 
+            await asyncio.sleep(15.0)
         except Exception as e:
             logger.error(f"[{agent.name}] LOOP CRASHED: {e}")
             await asyncio.sleep(10.0)
