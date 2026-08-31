@@ -1,6 +1,7 @@
 import json
 import logging
 import random
+import math
 import asyncio
 from typing import List, Optional
 from pydantic import BaseModel
@@ -23,9 +24,10 @@ class Cell(BaseModel):
     resource_type: Optional[str] = None  # 'Matter', 'Energy', 'Imagination'
     mine_level: int = 0
     mine_hp: int = 0
-    structure: Optional[str] = None      # 'Wall'
+    structure: Optional[str] = None      # 'Wall', 'Casino'
     wall_hp: int = 0
     loot: dict = {}  # {'matter': x, 'energy': y, 'imagination': z}
+    casino_jackpot: int = 0  # Accumulated jackpot from lost bets
 
 class MapCore:
     def __init__(self, width: int = 5, height: int = 5):
@@ -45,6 +47,22 @@ class MapCore:
             cells[i].resource_type = res
             cells[i].mine_level = 1
             cells[i].mine_hp = 50
+
+    def spawn_casinos(self, count: int = 3):
+        """Размещает казино на пустых клетках (без шахт, стен и других структур)."""
+        empty_cells = [
+            cell for row in self.grid for cell in row
+            if cell.resource_type is None and cell.structure is None
+        ]
+        random.shuffle(empty_cells)
+        placed = 0
+        for cell in empty_cells:
+            if placed >= count:
+                break
+            cell.structure = 'Casino'
+            cell.casino_jackpot = random.randint(50, 200)  # Initial jackpot seed
+            placed += 1
+            logger.info(f"🎰 Казино размещено на ({cell.pos.x}, {cell.pos.y}) [Jackpot: {cell.casino_jackpot}]")
 
     def get_cell(self, x: int, y: int) -> Optional[Cell]:
         if 0 <= x < self.width and 0 <= y < self.height:
@@ -70,6 +88,8 @@ class MapCore:
                     "structure": c.structure,
                     "wall_hp": c.wall_hp
                 }
+                if c.structure == 'Casino':
+                    cell_data["casino_jackpot"] = c.casino_jackpot
                 if any(v > 0 for v in c.loot.values()):
                     cell_data["loot"] = c.loot
                 state.append(cell_data)
@@ -169,7 +189,8 @@ class Stage2AI:
             actions_str += f"6. BUILD_MINE: {{\"action\": \"BUILD_MINE\", \"params\": {{\"target_x\": X, \"target_y\": Y, \"type\": \"Matter\"}}}} (type: Matter/Energy/Imagination). Cost: 50 Matter, 50 Energy. Creates mine on empty cell.\n"
         if "logistics_lvl_3" in self.unlocked_techs:
             actions_str += f"7. JUMP: {{\"action\": \"JUMP\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}. Cost: 50 Energy. Teleports to any cell.\n"
-        actions_str += "8. PASS: {\"action\": \"PASS\"}\n"
+        actions_str += "8. GAMBLE: {\"action\": \"GAMBLE\", \"params\": {\"target_x\": X, \"target_y\": Y, \"bet\": AMOUNT, \"resource\": \"matter\"/\"energy\"/\"imagination\"}}. MUST be adjacent/on a 🎰 Casino cell. Min bet: 10. 40% chance to WIN 2x, 5% JACKPOT (3x + jackpot pool), 55% LOSE bet.\n"
+        actions_str += "9. PASS: {\"action\": \"PASS\"}\n"
 
         # --- Build memory sections ---
         # Short-term: last 4 actions (бортовой журнал)
@@ -196,6 +217,7 @@ class Stage2AI:
             f"- MOVE: Navigate the map. Blocked by Walls or Enemies. Loot is auto-picked up.\n"
             f"- ATTACK: Deals damage. Targets: Enemies, Walls, or Mines.\n"
             f"- BUILD: Builds a Wall on an adjacent cell.\n"
+            f"- GAMBLE: Go to a 🎰 Casino cell and bet resources for a chance to multiply them! High risk, high reward.\n"
             f"- CAPTURE: Reprograms a mine. Requires cell to be clear of enemies/walls.\n"
             f"MAP BOUNDARIES: DO NOT move outside 0-9! If at Y=0 cannot move N, Y=9 cannot move S, X=0 cannot move W, X=9 cannot move E.\n\n"
             f"Available actions (return strictly JSON):\n"
@@ -402,7 +424,7 @@ class ArbitorPhysical:
                 if avatar.balance["matter"] < build_cost:
                     return f"Недостаточно Материи (нужно {build_cost}) для постройки стены."
                 target_cell = map_core.get_cell(tx, ty)
-                if not target_cell or target_cell.structure == 'Wall':
+                if not target_cell or target_cell.structure in ('Wall', 'Casino'):
                     return "Здесь уже есть постройка или край карты."
                 
                 enemy_here = any(a.position.x == tx and a.position.y == ty and not a.is_dead for a in all_agents)
@@ -458,6 +480,49 @@ class ArbitorPhysical:
                     target_cell.owner_id = avatar.name
                     return f"Шахта на ({tx}, {ty}) перепрограммирована и захвачена."
                 return "Здесь нет шахты для захвата."
+
+            elif action == "GAMBLE":
+                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                bet = params.get("bet", 0)
+                resource = params.get("resource", "matter").lower()
+                
+                if resource not in ["matter", "energy", "imagination"]:
+                    return "Неверный тип ресурса для ставки."
+                
+                if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)) and not (avatar.position.x == tx and avatar.position.y == ty):
+                    return "Казино вне зоны досягаемости."
+                    
+                target_cell = map_core.get_cell(tx, ty)
+                if not target_cell or target_cell.structure != 'Casino':
+                    return f"На ({tx}, {ty}) нет казино!"
+                    
+                if not isinstance(bet, (int, float)) or bet < 10:
+                    return "Минимальная ставка: 10 ресурсов."
+                bet = int(bet)
+                
+                if avatar.balance[resource] < bet:
+                    return f"Недостаточно {resource} для ставки {bet}."
+                
+                # Снимаем ставку
+                avatar.balance[resource] -= bet
+                
+                # Бросок! 
+                roll = random.random()
+                
+                if roll < 0.05:  # 5% — ДЖЕКПОТ!
+                    winnings = bet * 3 + target_cell.casino_jackpot
+                    avatar.balance[resource] += winnings
+                    jackpot_won = target_cell.casino_jackpot
+                    target_cell.casino_jackpot = random.randint(50, 150)  # Reset jackpot
+                    return f"🎰🎰🎰 ДЖЕКПОТ!!! Выигрыш: {winnings} {resource} (3x ставка + {jackpot_won} джекпот)! Невероятная удача!"
+                elif roll < 0.45:  # 40% — ВЫИГРЫШ (2x)
+                    winnings = bet * 2
+                    avatar.balance[resource] += winnings
+                    return f"🎰 ВЫИГРЫШ! Получено {winnings} {resource} (2x ставка). Удача улыбнулась!"
+                else:  # 55% — ПРОИГРЫШ
+                    # Часть проигрыша идёт в джекпот
+                    target_cell.casino_jackpot += int(bet * 0.3)
+                    return f"🎰 ПРОИГРЫШ! Потеряно {bet} {resource}. Джекпот вырос до {target_cell.casino_jackpot}."
 
             return f"Действие {action} обработано."
 
@@ -539,6 +604,7 @@ async def main_simulation():
 
     world_map = MapCore(width=7, height=7)
     world_map.spawn_mines()
+    world_map.spawn_casinos(2)
     arbiter = ArbitorPhysical()
 
     agents = [

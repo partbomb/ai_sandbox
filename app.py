@@ -140,9 +140,9 @@ def api_start():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
     
-    # Инициализация мира 10x10
     web_state.world_map = world.MapCore(width=10, height=10)
     web_state.world_map.spawn_mines()
+    web_state.world_map.spawn_casinos(4)  # 4 казино на карте 10x10
     web_state.arbiter = world.ArbitorPhysical()
     
     import random
@@ -195,7 +195,8 @@ def get_state():
                 "owner": cell.owner_id,
                 "resource": cell.resource_type,
                 "structure": cell.structure,
-                "avatar": avatar
+                "avatar": avatar,
+                "casino_jackpot": cell.casino_jackpot if cell.structure == 'Casino' else 0
             })
         grid_data.append(row)
         
@@ -289,6 +290,20 @@ HTML_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; font-size: 24px;
             position: relative; border: 2px solid transparent; transition: 0.3s;
         }
+        .cell-casino {
+            background: linear-gradient(135deg, rgba(245,158,11,0.15), rgba(234,88,12,0.15)) !important;
+            border-color: rgba(245,158,11,0.4) !important;
+            animation: casino-pulse 2s ease-in-out infinite;
+        }
+        @keyframes casino-pulse {
+            0%, 100% { box-shadow: 0 0 5px rgba(245,158,11,0.2); }
+            50% { box-shadow: 0 0 15px rgba(245,158,11,0.5); }
+        }
+        .jackpot-label {
+            position: absolute; bottom: -2px; left: 50%; transform: translateX(-50%);
+            font-size: 7px; color: #f59e0b; font-weight: 700; font-family: 'JetBrains Mono';
+            white-space: nowrap; text-shadow: 0 0 3px rgba(0,0,0,0.8);
+        }
         
         .avatar-badge {
             position: absolute; right: -6px; top: -6px; width: 20px; height: 20px;
@@ -342,6 +357,7 @@ HTML_TEMPLATE = """
             <button onclick="fillAction('ATTACK', {target_x:0, target_y:0})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">ATTACK (0,0)</button>
             <button onclick="fillAction('BUILD', {target_x:0, target_y:0})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">BUILD (0,0)</button>
             <button onclick="fillAction('RESEARCH', {tech:'combat_lvl_1'})" style="padding:5px; background: #8b5cf6; color: white; border: none; cursor: pointer; border-radius: 4px;">RESEARCH</button>
+            <button onclick="fillAction('GAMBLE', {target_x:0, target_y:0, bet:50, resource:'matter'})" style="padding:5px; background: linear-gradient(135deg, #f59e0b, #ea580c); color: white; border: none; cursor: pointer; border-radius: 4px;">🎰 GAMBLE</button>
             <button onclick="fillAction('PASS', {})" style="padding:5px; background: #64748b; color: white; border: none; cursor: pointer; border-radius: 4px;">PASS</button>
         </div>
     </div>
@@ -515,7 +531,16 @@ HTML_TEMPLATE = """
                     const cell = grid[y][x];
                     
                     let content = '';
+                    let extraClass = '';
+                    let jackpotHtml = '';
                     if (cell.structure === 'Wall') content = '🧱';
+                    else if (cell.structure === 'Casino') {
+                        content = '🎰';
+                        extraClass = 'cell-casino';
+                        if (cell.casino_jackpot > 0) {
+                            jackpotHtml = `<div class="jackpot-label">💰${cell.casino_jackpot}</div>`;
+                        }
+                    }
                     else if (cell.resource === 'Matter') content = '⚛️';
                     else if (cell.resource === 'Energy') content = '⚡';
                     else if (cell.resource === 'Imagination') content = '💡';
@@ -532,7 +557,7 @@ HTML_TEMPLATE = """
                         avatarHtml = `<div class="avatar-badge" style="background: ${avatarColor};">🤖</div>`;
                     }
                     
-                    html += `<div class="cell" style="${cellStyle}">${content}${avatarHtml}</div>`;
+                    html += `<div class="cell ${extraClass}" style="${cellStyle}">${content}${avatarHtml}${jackpotHtml}</div>`;
                 }
             }
             mapEl.innerHTML = html;
