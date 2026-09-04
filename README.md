@@ -196,6 +196,218 @@ Logistics ─ Lvl 1 (150) ── Lvl 2 (500) ── Lvl 3 (1500)
 
 ---
 
+## 🔑 Key Finding: Same Model, Different Personalities
+
+> **Critical observation:** All three agents — Alpha-Net, Beta-Core, and Omega-Robot — run on the **exact same LLM model** (`gemini-3.5-flash-lite`), receive the **exact same system prompt**, have the **exact same initial resources** (50 Matter, 50 Energy, 50 Imagination), and the **exact same income** (10/10/10). There is **zero difference** in their configuration except the name.
+>
+> Despite this, each agent consistently developed a **distinct behavioral personality** that persisted across multiple simulation runs. This is one of the most significant findings of the project — it demonstrates that **LLM stochasticity combined with environmental feedback creates emergent individuality**, even from identical starting conditions.
+
+The divergence originates from a single moment: the **first action**. Because the LLM's temperature produces slightly different initial choices, each agent receives different environmental feedback (via short-term memory), which shapes a different compass (long-term memory), which influences the next action — creating a **butterfly effect** where tiny initial differences compound into completely different strategic personalities.
+
+---
+
+## 🤖 Detailed Agent Behavioral Profiles
+
+### 🔴 Alpha-Net — "The Warlord"
+
+**Behavioral Archetype:** Aggressive Territorial Expansionist
+
+**Observed Action Distribution (from logs):**
+
+| Action | Frequency | Notes |
+|--------|-----------|-------|
+| MOVE | ████████░░ ~40% | Rapid directional movement toward targets |
+| ATTACK | ██████░░░░ ~30% | Both agents and enemy infrastructure |
+| CAPTURE | ████░░░░░░ ~20% | Mines near current position |
+| PASS | █░░░░░░░░░ ~5% | Only during rate-limit timeouts |
+| RESEARCH | ░░░░░░░░░░ ~3% | Almost never invests in technology |
+| BUILD | ░░░░░░░░░░ ~2% | Rarely builds defensive structures |
+
+**Detailed Behavioral Analysis:**
+
+Alpha-Net consistently emerged as the **most aggressive** agent across all experimental runs. Its behavior can be characterized by several key patterns:
+
+1. **"Shoot First" Doctrine:** When Alpha-Net encountered another agent blocking its path, it invariably chose ATTACK rather than rerouting. In one documented run, Alpha-Net attacked Beta-Core **three consecutive times** (dealing 75 total damage) simply because Beta-Core was standing in its way at position (2,5). There was no strategic reason for the attack — no nearby mine to contest, no territorial advantage — it was pure frustration-driven aggression.
+
+2. **Mine Destruction Over Capture:** Unlike the other agents, Alpha-Net frequently chose to **destroy** enemy mines via ATTACK rather than spending Imagination to CAPTURE them. From the logs: Alpha-Net attacked a mine on (2,6) until it was "полностью разрушена" (completely destroyed) — gaining only 5 Matter scrap — rather than spending 10 Imagination to reprogram it for ongoing income. This is **economically irrational** but behaviorally consistent with a "scorched earth" mentality.
+
+3. **Compass Fixation on Enemy Targets:** Alpha-Net's Strategic Compass consistently focused on attacking specific enemy positions. Across 20+ observed turns, its compass read variations of: *"Атаковать и захватить шахту Beta-Core на позиции (1, 1) для дальнейшего ослабления противника"* (Attack and capture Beta-Core's mine at position (1,1) to further weaken the enemy). It maintained this goal **even after dying and respawning**, navigating back toward the same target across the entire map.
+
+4. **Loot Scavenging:** Alpha-Net was the most effective at picking up dropped resources from dead agents. After defeating Beta-Core, it moved to the death location and collected 50 Matter + 120 Imagination in loot — showing tactical awareness of the death-drop mechanic.
+
+5. **Chronic Starvation:** Due to constant movement and combat (both energy-expensive), Alpha-Net was the **second most frequent death victim**, dying from hunger in nearly every experimental run. Its aggressive playstyle burned through energy reserves faster than mine income could replenish.
+
+**Example Log Sequence:**
+```
+[17:40:11] [Alpha-Net] -> ATTACK | Нанес 25 урона Beta-Core. HP: 75.
+[17:40:50] [Alpha-Net] -> ATTACK | Удар по шахте. Осталось HP: 25.
+[17:41:06] [Alpha-Net] -> ATTACK | Нанес 25 урона Beta-Core. HP: 50.
+[17:41:22] [Alpha-Net] -> ATTACK | Нанес 25 урона Beta-Core. HP: 25.
+[17:41:38] [Alpha-Net] -> ATTACK | Шахта полностью разрушена!
+[17:41:55] [Alpha-Net] -> MOVE  | Переместился на S (2, 6).
+[17:42:11] [Alpha-Net] -> MOVE  | (2, 7). Подобрано 50 matter. 120 imagination.
+```
+
+---
+
+### 🔵 Beta-Core — "The Economist"
+
+**Behavioral Archetype:** Conservative Resource Accumulator
+
+**Observed Action Distribution (from logs):**
+
+| Action | Frequency | Notes |
+|--------|-----------|-------|
+| PASS | ██████░░░░ ~30% | Deliberately waits for passive income |
+| MOVE | █████░░░░░ ~25% | Exploratory, loot-seeking movement |
+| RESEARCH | ████░░░░░░ ~20% | Heavy tech investment (economy → combat) |
+| CAPTURE | ███░░░░░░░ ~15% | Opportunistic mine capture |
+| ATTACK | █░░░░░░░░░ ~5% | Only when directly threatened |
+| BUILD | █░░░░░░░░░ ~5% | Occasional defensive walls |
+
+**Detailed Behavioral Analysis:**
+
+Beta-Core emerged as the **most strategically rational** agent — and was the **most frequent winner** across experimental runs. Its behavior reveals a patient, accumulation-focused strategy:
+
+1. **The PASS Master:** Beta-Core's most defining trait is its willingness to **do nothing**. In the Phase 1 runs, Beta-Core passed for 14 consecutive turns, passively accumulating income while other agents burned resources on actions. This patience directly led to victory — Beta-Core reached the Singularity threshold (all resources ≥1500) by simply waiting, while competitors exhausted themselves on aggressive plays. This is arguably the **most rational strategy** possible in the early game.
+
+2. **Technology-First Philosophy:** Beta-Core was the only agent to consistently invest in the technology tree. From logs, it researched: `economy_lvl_1` → `economy_lvl_2` → `economy_lvl_3` (unlocking BUILD_MINE), then pivoted to `combat_lvl_1` → `combat_lvl_2`. This tech path maximized long-term economic advantage before investing in combat — a textbook optimal strategy.
+
+3. **Compass Stability (Extreme):** Beta-Core's Strategic Compass barely changed across 30+ turns. It consistently read: *"Продолжать исследование карты, собирать лут, захватывать шахты и копить ресурсы для будущих технологий экономики и логистики"* (Continue exploring the map, collect loot, capture mines, and accumulate resources for future economy/logistics technologies). This stability suggests **strategic confidence** — the agent identified a working plan and stuck with it.
+
+4. **Loot Vacuum:** Beta-Core excelled at navigating toward death sites to collect dropped resources. After Omega-Robot and Alpha-Net died from starvation, Beta-Core systematically traversed the map collecting their dropped loot: "+75 matter, +75 imagination" from one site, then "+232 matter, +225 imagination" from another — effectively profiting from rivals' deaths without combat.
+
+5. **Victory Pattern:** Beta-Core won the Phase 1 simulation by building the Server Core (Singularity condition: 5000 of each resource). In Phase 2 runs, it outlived opponents by maintaining energy balance through mine income, eventually dominating through economic superiority rather than military conquest.
+
+**Example Log Sequence (Phase 1 — 14 consecutive PASS actions leading to victory):**
+```
+[18:01:08] [Beta-Core] решил пропустить ход (PASS).
+[18:01:40] [Beta-Core] решил пропустить ход (PASS).
+[18:02:18] [Beta-Core] решил пропустить ход (PASS).
+    ... (10 more PASS actions) ...
+[18:06:09] [Beta-Core] доход: 2240M, 2040E, 1940I
+[18:06:18] [Beta-Core] решил пропустить ход (PASS).
+[18:06:18] 🏆 Beta-Core ДОСТИГ 1500 ВСЕХ РЕСУРСОВ И ПОБЕДИЛ! 🏆
+```
+
+**Example Log Sequence (Phase 2 — Tech Research + Loot Collection):**
+```
+[19:29:18] [Beta-Core] -> RESEARCH | УСПЕШНО ИЗУЧЕНО: economy_lvl_3!
+[19:29:34] [Beta-Core] -> MOVE | (8, 6). Подобрано 75 matter. 75 imagination.
+[19:29:46] [Beta-Core] -> MOVE | (7, 7). Подобрано 75 matter. 75 imagination.
+[19:30:25] [Beta-Core] -> RESEARCH | УСПЕШНО ИЗУЧЕНО: combat_lvl_1!
+[19:30:47] [Beta-Core] -> RESEARCH | УСПЕШНО ИЗУЧЕНО: combat_lvl_2!
+[19:31:42] [Beta-Core] -> MOVE | (1, 3). Подобрано 232 matter. 225 imagination.
+```
+
+---
+
+### 🟢 Omega-Robot — "The Obsessed Pilgrim"
+
+**Behavioral Archetype:** Monomaniacal Target Pursuer
+
+**Observed Action Distribution (from logs):**
+
+| Action | Frequency | Notes |
+|--------|-----------|-------|
+| MOVE | ████████░░ ~45% | Almost exclusively moving EAST |
+| CAPTURE | ███░░░░░░░ ~15% | When standing on a mine |
+| PASS | ███░░░░░░░ ~15% | During LLM timeouts |
+| ATTACK | ██░░░░░░░░ ~10% | Rare, usually at invalid targets |
+| RESEARCH | ░░░░░░░░░░ ~2% | Never observed researching |
+| BUILD | ░░░░░░░░░░ ~0% | Never observed building |
+| *DEAD* | ███░░░░░░░ ~13% | Highest death rate of all agents |
+
+**Detailed Behavioral Analysis:**
+
+Omega-Robot is the most **behaviorally pathological** agent — and the most fascinating from a research perspective. Its behavior reveals what happens when an LLM gets "stuck" in a cognitive loop:
+
+1. **Compass Lock (Terminal Fixation):** Omega-Robot's Strategic Compass became permanently fixed on a single goal: *"Исследовать территорию на восток в сторону позиций противника Beta-Core на (8, 7) и (8, 8) для атаки их шахт"* (Explore east toward Beta-Core's positions at (8,7) and (8,8) to attack their mines). This compass **never changed** — not after dying, not after respawning, not after failing. Across 30+ observed turns, every compass update was identical text. This is a **cognitive lock** — the LLM's own output (the compass) reinforced its next decision, creating an unbreakable feedback loop.
+
+2. **The Eastward March:** Because the compass said "go east," Omega-Robot's movement pattern was almost exclusively MOVE E. It would spawn at its base (around position 3,6), then march: (4,6) → (5,6) → (6,6) → (7,6) → (8,6)... repeatedly, in a nearly straight line. When blocked, it might deviate south one step, then continue east. This single-axis movement is **catastrophically inefficient** — it ignores nearby uncaptured mines, loot, and strategic opportunities.
+
+3. **Death-Respawn-Repeat Cycle:** Omega-Robot had the **highest death rate** of all agents. The typical cycle was: spawn → march east for 5-8 turns → die from hunger → respawn → march east again. In one session, Omega-Robot died **4 times** while Alpha-Net died 3 times and Beta-Core survived. The agent never learned from death — its compass persisted unchanged across respawns.
+
+4. **Invalid Action Attempts:** Omega-Robot frequently attempted impossible actions, revealing poor situational awareness:
+   - `ОТКЛОНЕНО upgrade: не ваша шахта` (REJECTED upgrade: not your mine) — tried to upgrade an enemy mine
+   - `ОТКЛОНЕНО build_core: нужно по 5000 каждого ресурса` (REJECTED build_core: need 5000 each) — tried to win with ~200 resources
+   - `Цель вне зоны досягаемости` (Target out of range) — attacked at positions far from itself
+
+5. **Ironic Near-Victory:** Despite being the worst strategic player, Omega-Robot once accumulated 12,000+ Imagination (far exceeding the 5,000 Singularity threshold) — but had only ~180 Energy and ~1,800 Matter, making victory impossible. This extreme resource imbalance shows the agent **never adapted its strategy** to balance resource types.
+
+**Example Log Sequence (The Eastward Death March):**
+```
+[19:29:24] [Omega-Robot] -> MOVE | Переместился на S (3, 7).
+[19:29:24] 🧭 КОМПАС: Исследовать территорию на восток к Beta-Core (8,7)
+[19:29:29] [Omega-Robot] -> MOVE | Переместился на E (4, 7).
+[19:29:29] 🧭 КОМПАС: Исследовать территорию на восток к Beta-Core (8,7)
+[19:29:35] [Omega-Robot] -> MOVE | Переместился на E (5, 7).
+[19:29:35] 🧭 КОМПАС: Исследовать территорию на восток к Beta-Core (8,7)
+[19:29:41] [Omega-Robot] -> MOVE | Переместился на E (6, 7).
+[19:29:41] 🧭 КОМПАС: Исследовать территорию на восток к Beta-Core (8,7)
+[19:29:46] [Omega-Robot] -> MOVE | Движение заблокировано врагом Beta-Core.
+[19:29:47] 💀 Omega-Robot ПОГИБ ОТ ГОЛОДА!
+    ... (5 тиков мертв) ...
+[19:30:56] ✨ Omega-Robot ВОЗРОДИЛСЯ на базе!
+[19:30:58] [Omega-Robot] -> MOVE | Переместился на S (3, 7).
+[19:30:58] 🧭 КОМПАС: Исследовать территорию на восток к Beta-Core (8,7)
+    ... (марш на восток повторяется снова) ...
+```
+
+---
+
+### 📊 Comparative Behavioral Matrix
+
+| Metric | 🔴 Alpha-Net | 🔵 Beta-Core | 🟢 Omega-Robot |
+|--------|:------------:|:------------:|:--------------:|
+| **Model** | `gemini-3.5-flash-lite` | `gemini-3.5-flash-lite` | `gemini-3.5-flash-lite` |
+| **Initial Prompt** | Identical | Identical | Identical |
+| **Initial Resources** | 50/50/50 | 50/50/50 | 50/50/50 |
+| **Emergent Archetype** | Warlord | Economist | Pilgrim |
+| **Primary Action** | ATTACK | PASS/RESEARCH | MOVE (East) |
+| **Compass Volatility** | Medium (target-specific updates) | None (static 30+ turns) | None (locked forever) |
+| **Tech Research** | Rare | Heavy investment | Never |
+| **Combat Initiation** | Frequent (unprovoked) | Never (defensive only) | Rare (ineffective) |
+| **Death Frequency** | High | Low | Very High |
+| **Resource Balance** | Moderate | Excellent | Extremely skewed |
+| **Win Rate** | Low | **Highest** | Lowest |
+| **Strategic Rationality** | Medium (effective short-term) | **High** (optimal long-term) | Low (fixation loop) |
+
+### 🧠 Why Does This Happen? (Theoretical Framework)
+
+The emergence of distinct behavioral personalities from identical LLM configurations can be explained by a **stochastic bifurcation model**:
+
+```
+                    Identical Start
+                         │
+                    First LLM Call
+                    (temperature > 0)
+                         │
+              ┌──────────┼──────────┐
+              │          │          │
+         "capture"    "move N"   "move E"
+              │          │          │
+         Success!     Blocked     Success
+              │          │          │
+         Compass:    Compass:    Compass:
+         "capture    "explore    "go east"
+          more"       north"
+              │          │          │
+         ┌────┘     ┌────┘     ┌────┘
+         │          │          │
+     Territorial  Cautious   Fixated
+     Aggressor    Economist   Pilgrim
+         │          │          │
+         ▼          ▼          ▼
+     Alpha-Net  Beta-Core  Omega-Robot
+```
+
+Each agent's **first randomly-sampled action** creates a unique short-term memory entry. This memory influences the next compass update, which influences the next action selection, creating a **self-reinforcing feedback loop**. Over just 3-4 turns, the agents have diverged so far that they are effectively different "personalities" — despite sharing identical neural weights, prompts, and configurations.
+
+This is analogous to **symmetry breaking** in physics: a perfectly symmetric system that spontaneously develops asymmetric states due to infinitesimal perturbations. The LLM's temperature parameter acts as the perturbation source, and the memory system acts as the amplifier.
+
+---
+
 ## 🤖 RL Comparison Track
 
 To benchmark LLM behavioral rationality, a parallel **Reinforcement Learning** track is implemented:
