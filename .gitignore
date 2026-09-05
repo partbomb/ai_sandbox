@@ -1,1 +1,6 @@
 /agents_config.json
+venv/
+__pycache__/
+*.pyc
+rl_logs/
+rl_models/

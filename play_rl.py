@@ -144,7 +144,7 @@ def play_random(episodes: int = 5):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Тест RL-агента")
-    parser.add_argument("--model", type=str, default="rl_models/best/best_model",
+    parser.add_argument("--model", type=str, default=None,
                         help="Путь к .zip модели (без .zip)")
     parser.add_argument("--episodes", type=int, default=5, help="Кол-во эпизодов")
     parser.add_argument("--no-render", action="store_true", help="Без визуализации")
@@ -154,8 +154,30 @@ if __name__ == "__main__":
     if args.random:
         play_random(args.episodes)
     else:
-        if not os.path.exists(args.model + ".zip") and not os.path.exists(args.model):
-            print(f"❌ Модель не найдена: {args.model}")
+        model_path = args.model
+        if model_path is None:
+            # Авто-поиск модели по приоритету
+            candidates = [
+                "rl_models/best/best_model",
+                "rl_models/sandbox_ppo_final",
+                "rl_models/sandbox_dqn_final",
+            ]
+            found = None
+            for c in candidates:
+                if os.path.exists(c + ".zip") or os.path.exists(c):
+                    found = c
+                    break
+            if not found and os.path.exists("rl_models"):
+                # Ищем любой .zip файл в rl_models
+                for f in os.listdir("rl_models"):
+                    if f.endswith(".zip"):
+                        found = os.path.join("rl_models", f[:-4])
+                        break
+            model_path = found
+
+        if not model_path or (not os.path.exists(model_path + ".zip") and not os.path.exists(model_path)):
+            print(f"❌ Модель не найдена: {args.model or 'rl_models/best/best_model'}")
             print(f"   Сначала обучи: python train_rl.py")
             sys.exit(1)
-        play(args.model, args.episodes, render=not args.no_render)
+
+        play(model_path, args.episodes, render=not args.no_render)

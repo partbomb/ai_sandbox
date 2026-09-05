@@ -134,8 +134,8 @@ def train(algo_name: str = "PPO", total_steps: int = 500_000,
         EvalCallback(
             eval_env,
             best_model_save_path=os.path.join(save_dir, "best"),
-            eval_freq=25_000,
-            n_eval_episodes=10,
+            eval_freq=max(1000, 10_000 // n_envs),
+            n_eval_episodes=5,
             deterministic=True,
         ),
     ]
