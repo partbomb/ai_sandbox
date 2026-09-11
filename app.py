@@ -20,6 +20,9 @@ class WebState:
         self.agents: List[world.Stage2AI] = []
         self.arbiter: world.ArbitorPhysical = None
         self.tasks = []
+        self.async_tasks = []
+        self.game_over = False
+        self.winner = ""
         
         # Создаем луп в отдельном потоке
         self.async_loop = asyncio.new_event_loop()
@@ -86,18 +89,21 @@ class WebState:
                             if agent.balance["matter"] >= 5000 and agent.balance["energy"] >= 5000 and agent.balance["imagination"] >= 5000:
                                 self.add_log("TICK", f"🏆 {agent.name} ДОСТИГ ТЕХНОЛОГИЧЕСКОЙ СИНГУЛЯРНОСТИ И ПОБЕДИЛ!")
                                 logging.info(f"🏆 {agent.name} ДОСТИГ ТЕХНОЛОГИЧЕСКОЙ СИНГУЛЯРНОСТИ И ПОБЕДИЛ!")
-                                self.started = False
+                                self.game_over = True
+                                self.winner = agent.name
                                 break
                                 
                             agent_mines = matter_mines + energy_mines + imag_mines
                             if total_mines > 0 and (agent_mines / total_mines) >= 0.8:
                                 self.add_log("TICK", f"🏆 {agent.name} ДОСТИГ АБСОЛЮТНОЙ МОНОПОЛИИ (80% шахт) И ПОБЕДИЛ!")
                                 logging.info(f"🏆 {agent.name} ДОСТИГ АБСОЛЮТНОЙ МОНОПОЛИИ (80% шахт) И ПОБЕДИЛ!")
-                                self.started = False
+                                self.game_over = True
+                                self.winner = agent.name
                                 break
-                        if not self.started:
-                            for task in self.tasks: task.cancel()
-                            self.tasks.clear()
+                        if not self.started or self.game_over:
+                            for task in self.async_tasks:
+                                self.async_loop.call_soon_threadsafe(task.cancel)
+                            self.async_tasks.clear()
             except Exception as e:
                 logging.error(f"Tick Loop Error: {e}")
             await asyncio.sleep(4.3)
@@ -129,6 +135,14 @@ class WebLogHandler(logging.Handler):
 logging.getLogger("WorldMap").addHandler(WebLogHandler())
 
 # --- API ---
+
+async def _create_agent_tasks(agents, world_map, arbiter, web_state):
+    for task in web_state.async_tasks:
+        task.cancel()
+    web_state.async_tasks = []
+    for agent in agents:
+        t = asyncio.create_task(world.agent_loop(agent, world_map, arbiter, agents))
+        web_state.async_tasks.append(t)
 
 @app.route('/api/start', methods=['POST'])
 def api_start():
@@ -170,9 +184,10 @@ def api_start():
     web_state.tasks.clear()
     
     # Запускаем независимые циклы для каждого агента
-    for agent in web_state.agents:
-        task = asyncio.run_coroutine_threadsafe(world.agent_loop(agent, web_state.world_map, web_state.arbiter, web_state.agents), web_state.async_loop)
-        web_state.tasks.append(task)
+    asyncio.run_coroutine_threadsafe(
+        _create_agent_tasks(web_state.agents, web_state.world_map, web_state.arbiter, web_state),
+        web_state.async_loop
+    )
         
     web_state.started = True
     return jsonify({"success": True})
@@ -204,6 +219,8 @@ def get_state():
     
     return jsonify({
         "started": True,
+        "game_over": web_state.game_over,
+        "winner": web_state.winner,
         "tick": web_state.tick,
         "map": grid_data,
         "agents": agents_data,
@@ -223,7 +240,7 @@ def post_human_action():
     if human:
         data = request.get_json(silent=True)
         human.human_action = data
-        human.human_ready.set()
+        web_state.async_loop.call_soon_threadsafe(human.human_ready.set)
         return jsonify({"success": True})
     return jsonify({"success": False})
 

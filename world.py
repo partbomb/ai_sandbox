@@ -1,16 +1,27 @@
 import json
 import logging
 import random
-import math
 import asyncio
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
 # Настройка простого логгера для world.py
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("WorldMap")
+
+TECH_TREE = {
+    "combat_lvl_1": {"cost": 150, "parent": None},
+    "combat_lvl_2": {"cost": 500, "parent": "combat_lvl_1"},
+    "combat_lvl_3": {"cost": 1500, "parent": "combat_lvl_2"},
+    "economy_lvl_1": {"cost": 150, "parent": None},
+    "economy_lvl_2": {"cost": 500, "parent": "economy_lvl_1"},
+    "economy_lvl_3": {"cost": 1500, "parent": "economy_lvl_2"},
+    "logistics_lvl_1": {"cost": 150, "parent": None},
+    "logistics_lvl_2": {"cost": 500, "parent": "logistics_lvl_1"},
+    "logistics_lvl_3": {"cost": 1500, "parent": "logistics_lvl_2"}
+}
 
 # --- Базовые структуры карты ---
 
@@ -26,7 +37,7 @@ class Cell(BaseModel):
     mine_hp: int = 0
     structure: Optional[str] = None      # 'Wall', 'Casino'
     wall_hp: int = 0
-    loot: dict = {}  # {'matter': x, 'energy': y, 'imagination': z}
+    loot: dict = Field(default_factory=dict)  # {'matter': x, 'energy': y, 'imagination': z}
     casino_jackpot: int = 0  # Accumulated jackpot from lost bets
 
 class MapCore:
@@ -154,18 +165,6 @@ class Stage2AI:
     def generate_prompt(self, map_core: MapCore) -> str:
         surroundings = map_core.get_map_state_json()
         
-        TECH_TREE = {
-            "combat_lvl_1": {"cost": 150, "parent": None},
-            "combat_lvl_2": {"cost": 500, "parent": "combat_lvl_1"},
-            "combat_lvl_3": {"cost": 1500, "parent": "combat_lvl_2"},
-            "economy_lvl_1": {"cost": 150, "parent": None},
-            "economy_lvl_2": {"cost": 500, "parent": "economy_lvl_1"},
-            "economy_lvl_3": {"cost": 1500, "parent": "economy_lvl_2"},
-            "logistics_lvl_1": {"cost": 150, "parent": None},
-            "logistics_lvl_2": {"cost": 500, "parent": "logistics_lvl_1"},
-            "logistics_lvl_3": {"cost": 1500, "parent": "logistics_lvl_2"}
-        }
-        
         available_techs = []
         for tech, data in TECH_TREE.items():
             if tech not in self.unlocked_techs:
@@ -206,7 +205,7 @@ class Stage2AI:
             f"[3] ТВОИ ГЛАЗА (Текущее состояние):\n"
             f"  Имя: {self.name} | Позиция: X:{self.position.x}, Y:{self.position.y} | HP: {self.hp}/100\n"
             f"  Баланс: Matter={self.balance['matter']}, Energy={self.balance['energy']}, Imagination={self.balance['imagination']}\n"
-            f"  Карта (10x10, X:0-9, Y:0-9):\n{surroundings}\n\n"
+            f"  Карта ({map_core.width}x{map_core.height}, X:0-{map_core.width-1}, Y:0-{map_core.height-1}):\n{surroundings}\n\n"
             f"TECH STATUS:\n{tech_status}\n\n"
             f"WIN CONDITIONS:\n"
             f"  1. Singularity: 5000 of all resources.\n"
@@ -219,7 +218,7 @@ class Stage2AI:
             f"- BUILD: Builds a Wall on an adjacent cell.\n"
             f"- GAMBLE: Go to a 🎰 Casino cell and bet resources for a chance to multiply them! High risk, high reward.\n"
             f"- CAPTURE: Reprograms a mine. Requires cell to be clear of enemies/walls.\n"
-            f"MAP BOUNDARIES: DO NOT move outside 0-9! If at Y=0 cannot move N, Y=9 cannot move S, X=0 cannot move W, X=9 cannot move E.\n\n"
+            f"MAP BOUNDARIES: DO NOT move outside 0-{max(map_core.width-1, map_core.height-1)}! If at Y=0 cannot move N, Y={map_core.height-1} cannot move S, X=0 cannot move W, X={map_core.width-1} cannot move E.\n\n"
             f"Available actions (return strictly JSON):\n"
             f"{actions_str}\n"
             f"=== ИНСТРУКЦИЯ ПО ОТВЕТУ ===\n"
@@ -296,15 +295,11 @@ class ArbitorPhysical:
             if not isinstance(action_data, dict):
                 action_data = {}
             action = action_data.get("action", "PASS")
+            action = action.upper().strip()
             params = action_data.get("params", {})
             
             if action == "RESEARCH":
                 tech = params.get("tech")
-                TECH_TREE = {
-                    "combat_lvl_1": {"cost": 150, "parent": None}, "combat_lvl_2": {"cost": 500, "parent": "combat_lvl_1"}, "combat_lvl_3": {"cost": 1500, "parent": "combat_lvl_2"},
-                    "economy_lvl_1": {"cost": 150, "parent": None}, "economy_lvl_2": {"cost": 500, "parent": "economy_lvl_1"}, "economy_lvl_3": {"cost": 1500, "parent": "economy_lvl_2"},
-                    "logistics_lvl_1": {"cost": 150, "parent": None}, "logistics_lvl_2": {"cost": 500, "parent": "logistics_lvl_1"}, "logistics_lvl_3": {"cost": 1500, "parent": "logistics_lvl_2"}
-                }
                 if tech not in TECH_TREE:
                     return f"Технология {tech} не существует."
                 if tech in avatar.unlocked_techs:
@@ -357,7 +352,11 @@ class ArbitorPhysical:
                 if avatar.balance["energy"] < 50:
                     return "Недостаточно Энергии (нужно 50) для прыжка."
                 
-                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                try:
+                    tx = int(params.get("target_x", 0))
+                    ty = int(params.get("target_y", 0))
+                except (TypeError, ValueError):
+                    return "Неверные координаты цели."
                 target_cell = map_core.get_cell(tx, ty)
                 if not target_cell or target_cell.structure == 'Wall':
                     return "Нельзя прыгнуть сюда (стена или край карты)."
@@ -375,7 +374,11 @@ class ArbitorPhysical:
                 avatar.balance["energy"] -= 5
                 
                 dmg = 40 if "combat_lvl_1" in avatar.unlocked_techs else 25
-                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                try:
+                    tx = int(params.get("target_x", 0))
+                    ty = int(params.get("target_y", 0))
+                except (TypeError, ValueError):
+                    return "Неверные координаты цели."
                 if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)) and not (avatar.position.x == tx and avatar.position.y == ty):
                     return "Цель вне зоны досягаемости."
                     
@@ -416,7 +419,11 @@ class ArbitorPhysical:
                     return f"На ({tx}, {ty}) нет подходящей цели для атаки."
                     
             elif action == "BUILD":
-                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                try:
+                    tx = int(params.get("target_x", 0))
+                    ty = int(params.get("target_y", 0))
+                except (TypeError, ValueError):
+                    return "Неверные координаты цели."
                 if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)):
                     return "Цель вне зоны досягаемости."
                 
@@ -426,6 +433,8 @@ class ArbitorPhysical:
                 target_cell = map_core.get_cell(tx, ty)
                 if not target_cell or target_cell.structure in ('Wall', 'Casino'):
                     return "Здесь уже есть постройка или край карты."
+                if target_cell.resource_type is not None:
+                    return "Нельзя строить стену на шахте."
                 
                 enemy_here = any(a.position.x == tx and a.position.y == ty and not a.is_dead for a in all_agents)
                 if enemy_here: return "Невозможно строить: на клетке кто-то стоит."
@@ -441,7 +450,11 @@ class ArbitorPhysical:
                 if avatar.balance["matter"] < 50 or avatar.balance["energy"] < 50:
                     return "Недостаточно ресурсов (нужно 50 Matter, 50 Energy)."
                     
-                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                try:
+                    tx = int(params.get("target_x", 0))
+                    ty = int(params.get("target_y", 0))
+                except (TypeError, ValueError):
+                    return "Неверные координаты цели."
                 mine_type = params.get("type", "Matter")
                 if mine_type not in ["Matter", "Energy", "Imagination"]:
                     mine_type = "Matter"
@@ -465,7 +478,11 @@ class ArbitorPhysical:
             elif action == "CAPTURE":
                 if avatar.balance["imagination"] < 10:
                     return "Недостаточно Воображения (нужно 10) для захвата."
-                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                try:
+                    tx = int(params.get("target_x", 0))
+                    ty = int(params.get("target_y", 0))
+                except (TypeError, ValueError):
+                    return "Неверные координаты цели."
                 if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)) and not (avatar.position.x == tx and avatar.position.y == ty):
                     return "Слишком далеко для захвата."
                 target_cell = map_core.get_cell(tx, ty)
@@ -476,13 +493,19 @@ class ArbitorPhysical:
                 if target_cell.structure == 'Wall': return "Невозможно захватить: мешает стена!"
                 
                 if target_cell.resource_type:
+                    if target_cell.owner_id == avatar.name:
+                        return "Эта шахта уже принадлежит вам."
                     avatar.balance["imagination"] -= 10
                     target_cell.owner_id = avatar.name
                     return f"Шахта на ({tx}, {ty}) перепрограммирована и захвачена."
                 return "Здесь нет шахты для захвата."
 
             elif action == "GAMBLE":
-                tx, ty = params.get("target_x", -1), params.get("target_y", -1)
+                try:
+                    tx = int(params.get("target_x", 0))
+                    ty = int(params.get("target_y", 0))
+                except (TypeError, ValueError):
+                    return "Неверные координаты цели."
                 bet = params.get("bet", 0)
                 resource = params.get("resource", "matter").lower()
                 
@@ -552,8 +575,17 @@ async def agent_loop(agent: Stage2AI, map_core: MapCore, arbiter: ArbitorPhysica
     while True:
         try:
             if agent.is_dead:
-                await asyncio.sleep(2.0)
-                continue
+                agent.respawn_timer -= 1
+                if agent.respawn_timer <= 0:
+                    agent.is_dead = False
+                    agent.hp = 100
+                    agent.position.x = agent.base_position.x
+                    agent.position.y = agent.base_position.y
+                    agent.respawn_timer = 0
+                    logging.info(f"{agent.name} respawned at ({agent.base_position.x}, {agent.base_position.y})")
+                else:
+                    await asyncio.sleep(2.0)
+                    continue
 
             turn_number += 1
 
@@ -607,17 +639,16 @@ async def main_simulation():
     world_map.spawn_casinos(2)
     arbiter = ArbitorPhysical()
 
-    agents = [
-        Stage2AI(data["agents"][0]["name"], data["agents"][0]["api_key"], data["agents"][0]["model"], Position(x=0, y=0), data["agents"][0].get("income", {})),
-        Stage2AI(data["agents"][1]["name"], data["agents"][1]["api_key"], data["agents"][1]["model"], Position(x=6, y=6), data["agents"][1].get("income", {}))
-    ]
+    agents = []
+    for i, agent_data in enumerate(data["agents"]):
+        x = agent_data.get("start_x", 0 if i == 0 else 6)
+        y = agent_data.get("start_y", 0 if i == 0 else 6)
+        agents.append(Stage2AI(agent_data["name"], agent_data["api_key"], agent_data["model"], Position(x=x, y=y), agent_data.get("income", {})))
 
     # Запускаем отрисовку и каждого агента как отдельные независимые таски
-    tasks = [
-        asyncio.create_task(map_render_loop(world_map, agents)),
-        asyncio.create_task(agent_loop(agents[0], world_map, arbiter, agents)),
-        asyncio.create_task(agent_loop(agents[1], world_map, arbiter, agents))
-    ]
+    tasks = [asyncio.create_task(map_render_loop(world_map, agents))]
+    for agent in agents:
+        tasks.append(asyncio.create_task(agent_loop(agent, world_map, arbiter, agents)))
 
     # Ждем завершения (по сути бесконечно)
     await asyncio.gather(*tasks)

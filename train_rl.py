@@ -35,6 +35,7 @@ class RewardLoggerCallback(BaseCallback):
         self.log_freq = log_freq
         self.episode_rewards = []
         self.episode_lengths = []
+        self.episode_wins = []
 
     def _on_step(self) -> bool:
         # Собираем завершённые эпизоды
@@ -42,15 +43,16 @@ class RewardLoggerCallback(BaseCallback):
             if "episode" in info:
                 self.episode_rewards.append(info["episode"]["r"])
                 self.episode_lengths.append(info["episode"]["l"])
+                self.episode_wins.append(1 if info.get("result") == "WIN" else 0)
 
         if self.num_timesteps % self.log_freq == 0 and self.episode_rewards:
             mean_r = np.mean(self.episode_rewards[-100:])
             mean_l = np.mean(self.episode_lengths[-100:])
-            wins = sum(1 for info in self.locals.get("infos", [])
-                       if info.get("result") == "WIN")
+            win_rate = np.mean(self.episode_wins[-100:]) * 100 if self.episode_wins else 0.0
             print(f"  [{self.num_timesteps:>8} steps] "
                   f"Reward: {mean_r:>8.2f} | "
                   f"Ep Length: {mean_l:>6.0f} | "
+                  f"Win Rate: {win_rate:>5.1f}% | "
                   f"Episodes: {len(self.episode_rewards)}")
         return True
 
@@ -127,7 +129,7 @@ def train(algo_name: str = "PPO", total_steps: int = 500_000,
     callbacks = [
         RewardLoggerCallback(log_freq=5000),
         CheckpointCallback(
-            save_freq=50_000,
+            save_freq=max(10_000, 50_000 // n_envs),
             save_path=save_dir,
             name_prefix=f"sandbox_{algo_name.lower()}"
         ),

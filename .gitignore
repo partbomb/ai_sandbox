@@ -1,6 +1,17 @@
 /agents_config.json
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
 rl_logs/
 rl_models/
+first_run.txt
+.env
+*.env
+.DS_Store
+.idea/
+.vscode/

@@ -72,21 +72,7 @@ PROMPT_STAGE1 = (
     "8. Build Core (Costs 5000 M, 5000 E, 5000 I. WINS THE GAME): {\"thoughts\": \"...\", \"action\": \"build_core\"}"
 )
 
-PROMPT_ARBITER = """You are the Arbiter of a simulation game. 
-Your task is to evaluate the action of an AI agent and determine its outcome based on the rules.
-You will receive the agent's current state (balance, income) and the map state.
-Actions:
-- capture: Empty cells are free. Enemy cells cost 300 Energy. Validates coordinates.
-- build_wall: Costs 150 Matter and 150 Imagination. Makes cell impenetrable.
-- upgrade_mine: Upgrading to Lvl 2 costs 200 resource, Lvl 3 costs 400 resource. Increases income.
-- pass: No action.
-Return JSON strictly in this format:
-{
-    "approved": true/false,
-    "reason": "Explanation",
-    "balance_change": {"matter": x, "energy": y, "imagination": z},
-    "income_change": {"matter": x, "energy": y, "imagination": z}
-}"""
+
 
 # Ядро
 
@@ -126,12 +112,6 @@ class ArbitorAI:
     def __init__(self):
         self.stage: int = 1
         logger.info("Arbitor_AI инициализирован. Следит за правилами.")
-
-    def evaluate_breakthrough(self, agent_state: AgentState, target_agent: 'Stage1AI') -> str:
-        """Проверка"""
-        logger.debug(f"Arbitor_AI проверяет breakthrough для агента {agent_state.name}...")
-        # Заглушка
-        return "Breakthrough approved: +5 Matter income, cost: 50 Energy."
 
     def get_random_events(self, count: int = 5) -> List[GameEvent]:
         """Возвращает выборку из нескольких событий"""
@@ -212,7 +192,7 @@ class ArbitorAI:
                             
                             # Hit avatar
                             elif all_agents:
-                                target_agent = next((a for a in all_agents if a.x == tx and a.y == ty and not a.is_dead), None)
+                                target_agent = next((a for a in all_agents if a.x == tx and a.y == ty and not a.is_dead and a.name != agent_state.name), None)
                                 if target_agent:
                                     target_agent.hp -= 25
                                     logger.info(f"[{agent_state.name}] бьет Аватара {target_agent.name}! HP: {target_agent.hp}")
@@ -349,7 +329,6 @@ class ArbitorAI:
 class Stage1AI:
     def __init__(self, state: AgentState):
         self.state = state
-        self.url: str = f"https://api.{self.state.model}.example.com" # Пример
         logger.info(f"ИИ Агент [{self.state.name}] готов к работе.")
 
     def generate_prompt(self, map_core: Optional['world.MapCore'] = None) -> str:
@@ -364,10 +343,6 @@ class Stage1AI:
             f"{map_info}"
         )
         return prompt
-
-    def trade(self):
-        # Обмен
-        pass
 
 
 # Конфиг
@@ -398,7 +373,17 @@ def run_simulation():
         return
 
     arbitor = ArbitorAI()
+    
+    map_core = world.MapCore(5, 5)
+    map_core.spawn_mines()
+
     agents = [Stage1AI(state) for state in agents_data]
+    
+    spawn_positions = [(0, 0), (4, 4), (2, 2)]
+    for i, ai in enumerate(agents):
+        pos = spawn_positions[i % len(spawn_positions)]
+        ai.state.x, ai.state.y = pos[0], pos[1]
+        ai.state.home_x, ai.state.home_y = pos[0], pos[1]
 
     time_tick = 0
     game_over = False
@@ -426,14 +411,19 @@ def run_simulation():
             ai.state.balance.imagination += ai.state.income.imagination
             logger.info(f"[{ai.state.name}] получил доход. Текущий Matter: {ai.state.balance.matter}, Energy: {ai.state.balance.energy}, Imagination: {ai.state.balance.imagination}")
 
+            ai.state.balance.energy -= 15
+            if ai.state.balance.energy < 0:
+                ai.state.is_dead = True
+                print(f"  💀 {ai.state.name} died from starvation!")
+
             # Промпт
-            prompt = ai.generate_prompt(current_events)
+            prompt = ai.generate_prompt(map_core)
             
             # API (Имитация ответа агента)
             response = api_bridge.send(ai.state.api_key, ai.state.model, prompt)
 
             # Арбитр проверяет ответ агента
-            arbitor.check_elements(ai.state, response, map_core=current_events, all_agents=[a.state for a in agents])
+            arbitor.check_elements(ai.state, response, map_core=map_core, all_agents=[a.state for a in agents])
 
             # Победа: нужно собрать по 1500 каждого ресурса
             if (ai.state.balance.matter >= 1500 and 

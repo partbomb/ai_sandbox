@@ -85,18 +85,6 @@ class SimpleCell:
         self.wall_hp: int = 0
         self.loot: Dict[str, int] = {"matter": 0, "energy": 0, "imagination": 0}
 
-    def copy(self) -> 'SimpleCell':
-        c = SimpleCell(self.x, self.y)
-        c.owner = self.owner
-        c.resource_type = self.resource_type
-        c.mine_level = self.mine_level
-        c.mine_hp = self.mine_hp
-        c.structure = self.structure
-        c.wall_hp = self.wall_hp
-        c.loot = dict(self.loot)
-        return c
-
-
 class SimpleAgent:
     """Состояние агента."""
     def __init__(self, name: str, x: int, y: int):
@@ -125,11 +113,14 @@ class SimpleMap:
             return self.grid[x][y]
         return None
 
-    def spawn_mines(self):
+    def spawn_mines(self, rng=None):
         """Размещает 9 шахт (по 3 каждого типа)."""
         resources = ['matter'] * 3 + ['energy'] * 3 + ['imagination'] * 3
         cells = [cell for row in self.grid for cell in row]
-        random.shuffle(cells)
+        if rng is not None:
+            rng.shuffle(cells)
+        else:
+            random.shuffle(cells)
         for i, res in enumerate(resources):
             cells[i].resource_type = res
             cells[i].mine_level = 1
@@ -194,7 +185,7 @@ class AISandboxEnv(gym.Env):
         super().reset(seed=seed)
 
         self.game_map = SimpleMap(MAP_SIZE)
-        self.game_map.spawn_mines()
+        self.game_map.spawn_mines(self.np_random)
 
         self.player = SimpleAgent("player", 0, 0)
         self.bot = SimpleAgent("bot", MAP_SIZE - 1, MAP_SIZE - 1)
@@ -346,6 +337,7 @@ class AISandboxEnv(gym.Env):
         for tech in TECH_NAMES:
             obs.append(1.0 if tech in self.player.techs else 0.0)
 
+        obs = np.clip(obs, 0.0, 1.0)
         return np.array(obs, dtype=np.float32)
 
     # ----------------------------------------------------------
@@ -639,6 +631,7 @@ class AISandboxEnv(gym.Env):
             # Сброс лута на текущую клетку
             cell = self.game_map.get_cell(agent.x, agent.y)
             if cell:
+                agent.balance["energy"] = max(0, agent.balance["energy"])
                 for res in ["matter", "energy", "imagination"]:
                     cell.loot[res] = cell.loot.get(res, 0) + agent.balance[res]
                     agent.balance[res] = 0

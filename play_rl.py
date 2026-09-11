@@ -15,7 +15,6 @@ import numpy as np
 
 from stable_baselines3 import PPO, DQN
 
-import rl_env
 from rl_env import AISandboxEnv, NUM_ACTIONS
 
 
@@ -34,12 +33,12 @@ def play(model_path: str, episodes: int = 5, render: bool = True):
     """Запускает обученного агента и показывает его игру."""
 
     # --- Определяем тип модели ---
-    if "dqn" in model_path.lower():
-        model = DQN.load(model_path)
-        algo_name = "DQN"
-    else:
+    try:
         model = PPO.load(model_path)
         algo_name = "PPO"
+    except Exception:
+        model = DQN.load(model_path)
+        algo_name = "DQN"
 
     print(f"\n🤖 Загружена модель: {model_path} ({algo_name})")
     print(f"   Играем {episodes} эпизодов...\n")
@@ -132,9 +131,12 @@ def play_random(episodes: int = 5):
 
         while not done:
             action = env.action_space.sample()
-            obs, reward, terminated, truncated, _ = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             ep_reward += reward
+
+        if info.get("result") == "WIN":
+            wins += 1
 
         rewards.append(ep_reward)
 
