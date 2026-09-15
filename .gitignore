@@ -7,8 +7,6 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-rl_logs/
-rl_models/
 first_run.txt
 .env
 *.env
