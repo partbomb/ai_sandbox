@@ -177,6 +177,10 @@ class AISandboxEnv(gym.Env):
         self.bot: Optional[SimpleAgent] = None
         self.steps = 0
 
+        # Tracking для shaped rewards
+        self._prev_mines_owned = 0
+        self._prev_total_resources = 0
+
     # ----------------------------------------------------------
     # Gymnasium API
     # ----------------------------------------------------------
@@ -190,6 +194,10 @@ class AISandboxEnv(gym.Env):
         self.player = SimpleAgent("player", 0, 0)
         self.bot = SimpleAgent("bot", MAP_SIZE - 1, MAP_SIZE - 1)
         self.steps = 0
+
+        # Reset tracking
+        self._prev_mines_owned = 0
+        self._prev_total_resources = sum(self.player.balance.values())
 
         return self._get_obs(), {}
 
@@ -205,6 +213,8 @@ class AISandboxEnv(gym.Env):
             r, i = self._execute_action(self.player, self.bot, action)
             reward += r
             info.update(i)
+        else:
+            reward -= 1.0  # Сильный штраф за нахождение в мёртвом состоянии
 
         # 2) Ход бота
         if not self.bot.is_dead:
@@ -229,18 +239,56 @@ class AISandboxEnv(gym.Env):
             terminated = True
             info["result"] = "LOSE"
 
-        # 6) Штраф за время
-        reward -= 0.01
+        # 6) Shaped rewards — промежуточные награды за прогресс
+        if not terminated:
+            reward += self._shaped_reward()
 
         # 7) Лимит ходов
         if self.steps >= self.max_steps:
             truncated = True
             info["result"] = info.get("result", "TIMEOUT")
+            # Бонус/штраф в конце по позиции
+            mines_player = self.game_map.count_mines_owned_by("player")
+            mines_bot = self.game_map.count_mines_owned_by("bot")
+            if mines_player > mines_bot:
+                reward += 20.0  # Контролируем больше шахт
+            elif mines_player < mines_bot:
+                reward -= 10.0
 
         if self.render_mode == "human":
             self.render()
 
         return self._get_obs(), reward, terminated, truncated, info
+
+    def _shaped_reward(self) -> float:
+        """Промежуточные награды за прогресс к победе."""
+        shaped = 0.0
+
+        # 1) Награда за изменение числа контролируемых шахт
+        mines_now = self.game_map.count_mines_owned_by("player")
+        mine_delta = mines_now - self._prev_mines_owned
+        if mine_delta > 0:
+            shaped += 5.0 * mine_delta   # +5 за каждую новую шахту
+        elif mine_delta < 0:
+            shaped += 3.0 * mine_delta   # -3 за потерю шахты
+        self._prev_mines_owned = mines_now
+
+        # 2) Награда за рост общих ресурсов (маленький бонус)
+        total_res = sum(self.player.balance.values())
+        res_delta = total_res - self._prev_total_resources
+        if res_delta > 0:
+            shaped += min(res_delta * 0.01, 1.0)  # Макс +1 за ход
+        self._prev_total_resources = total_res
+
+        # 3) Штраф за простой (0 шахт после 50 шагов)
+        if self.steps > 50 and mines_now == 0:
+            shaped -= 0.1
+
+        # 4) Бонус за выживание (небольшой)
+        if not self.player.is_dead:
+            shaped += 0.02
+
+        return shaped
 
     def render(self):
         """ASCII-визуализация карты."""
@@ -583,26 +631,29 @@ class AISandboxEnv(gym.Env):
                         best_cell = cell
 
         if best_cell and bot.balance["energy"] >= 5:
-            dx = np.sign(best_cell.x - bot.x)
-            dy = np.sign(best_cell.y - bot.y)
-            # Двигаемся по одной оси
-            nx, ny = bot.x + int(dx), bot.y + int(dy) if dx == 0 else bot.y
-            if dx != 0:
-                nx, ny = bot.x + int(dx), bot.y
-            else:
-                nx, ny = bot.x, bot.y + int(dy)
+            dx = int(np.sign(best_cell.x - bot.x))
+            dy = int(np.sign(best_cell.y - bot.y))
 
-            target = gm.get_cell(nx, ny)
-            if target and target.structure != "wall":
-                if self.player.is_dead or not (self.player.x == nx and self.player.y == ny):
-                    bot.balance["energy"] -= 5
-                    bot.x = nx
-                    bot.y = ny
-                    # Подбор лута
-                    for res in ["matter", "energy", "imagination"]:
-                        if target.loot.get(res, 0) > 0:
-                            bot.balance[res] += target.loot[res]
-                            target.loot[res] = 0
+            # Пробуем два варианта движения (X, потом Y)
+            moves_to_try = []
+            if dx != 0:
+                moves_to_try.append((bot.x + dx, bot.y))
+            if dy != 0:
+                moves_to_try.append((bot.x, bot.y + dy))
+
+            for nx, ny in moves_to_try:
+                target = gm.get_cell(nx, ny)
+                if target and target.structure != "wall":
+                    if self.player.is_dead or not (self.player.x == nx and self.player.y == ny):
+                        bot.balance["energy"] -= 5
+                        bot.x = nx
+                        bot.y = ny
+                        # Подбор лута
+                        for res in ["matter", "energy", "imagination"]:
+                            if target.loot.get(res, 0) > 0:
+                                bot.balance[res] += target.loot[res]
+                                target.loot[res] = 0
+                        break  # Успешно двинулись
 
     # ----------------------------------------------------------
     # Income & Hunger
@@ -661,15 +712,15 @@ class AISandboxEnv(gym.Env):
             name = agent.name
             bal = agent.balance
 
-            # Singularity: 5000 каждого ресурса
-            if bal["matter"] >= 5000 and bal["energy"] >= 5000 and bal["imagination"] >= 5000:
+            # Singularity: 1000 каждого ресурса (снижено для 500 шагов)
+            if bal["matter"] >= 1000 and bal["energy"] >= 1000 and bal["imagination"] >= 1000:
                 return name
 
-            # Monopoly: 80%+ шахт
+            # Monopoly: 7+ из 9 шахт (78%)
             total = self.game_map.total_mines()
             if total > 0:
                 owned = self.game_map.count_mines_owned_by(name)
-                if owned / total >= 0.8:
+                if owned >= 7:
                     return name
 
         return None
