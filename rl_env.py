@@ -96,7 +96,7 @@ class SimpleAgent:
         self.respawn_timer = 0
         self.home_x = x
         self.home_y = y
-        self.balance: Dict[str, int] = {"matter": 50, "energy": 50, "imagination": 50}
+        self.balance: Dict[str, int] = {"matter": 100, "energy": 100, "imagination": 100}
         self.techs: List[str] = []
 
 
@@ -159,7 +159,7 @@ class AISandboxEnv(gym.Env):
     """
     metadata = {"render_modes": ["human", "ansi"], "render_fps": 2}
 
-    def __init__(self, render_mode=None, max_steps=500, hunger=3):
+    def __init__(self, render_mode=None, max_steps=500, hunger=2):
         super().__init__()
         self.render_mode = render_mode
         self.max_steps = max_steps
@@ -198,6 +198,7 @@ class AISandboxEnv(gym.Env):
         # Reset tracking
         self._prev_mines_owned = 0
         self._prev_total_resources = sum(self.player.balance.values())
+        self._prev_dist_to_mine = self._dist_to_nearest_mine(self.player)
 
         return self._get_obs(), {}
 
@@ -277,18 +278,36 @@ class AISandboxEnv(gym.Env):
         total_res = sum(self.player.balance.values())
         res_delta = total_res - self._prev_total_resources
         if res_delta > 0:
-            shaped += min(res_delta * 0.01, 1.0)  # Макс +1 за ход
+            shaped += min(res_delta * 0.02, 1.5)  # Макс +1.5 за ход
         self._prev_total_resources = total_res
 
-        # 3) Штраф за простой (0 шахт после 50 шагов)
-        if self.steps > 50 and mines_now == 0:
-            shaped -= 0.1
-
-        # 4) Бонус за выживание (небольшой)
+        # 3) Навигационная награда — ближе к шахте = лучше
         if not self.player.is_dead:
-            shaped += 0.02
+            dist_now = self._dist_to_nearest_mine(self.player)
+            dist_delta = self._prev_dist_to_mine - dist_now  # + если приближаемся
+            shaped += dist_delta * 0.5  # +0.5 за каждую клетку приближения
+            self._prev_dist_to_mine = dist_now
+
+        # 4) Штраф за простой (0 шахт после 30 шагов)
+        if self.steps > 30 and mines_now == 0:
+            shaped -= 0.2
+
+        # 5) Бонус за выживание
+        if not self.player.is_dead:
+            shaped += 0.05
 
         return shaped
+
+    def _dist_to_nearest_mine(self, agent: SimpleAgent) -> float:
+        """Manhattan расстояние до ближайшей ничейной шахты."""
+        best_dist = MAP_SIZE * 2  # максимальное возможное
+        for row in self.game_map.grid:
+            for cell in row:
+                if cell.resource_type and cell.owner != agent.name:
+                    dist = abs(cell.x - agent.x) + abs(cell.y - agent.y)
+                    if dist < best_dist:
+                        best_dist = dist
+        return best_dist
 
     def render(self):
         """ASCII-визуализация карты."""
@@ -404,7 +423,7 @@ class AISandboxEnv(gym.Env):
             dx, dy = directions[action_idx]
             move_cost = 2 if "logistics_lvl_1" in agent.techs else 5
             if agent.balance["energy"] < move_cost:
-                reward -= 0.5  # штраф за невалидное действие
+                reward -= 1.0  # штраф за невалидное действие
                 info["action"] = "MOVE_FAIL_energy"
                 return reward, info
 
@@ -502,37 +521,37 @@ class AISandboxEnv(gym.Env):
             tx, ty = agent.x + odx, agent.y + ody
 
             if agent.balance["imagination"] < 10:
-                reward -= 0.5
+                reward -= 1.0
                 info["action"] = "CAPTURE_FAIL_imag"
                 return reward, info
 
             cell = self.game_map.get_cell(tx, ty)
             if cell is None:
-                reward -= 0.5
+                reward -= 1.0
                 info["action"] = "CAPTURE_FAIL_bounds"
                 return reward, info
 
             if not enemy.is_dead and enemy.x == tx and enemy.y == ty:
-                reward -= 0.5
+                reward -= 1.0
                 info["action"] = "CAPTURE_FAIL_enemy"
                 return reward, info
 
             if cell.structure == "wall":
-                reward -= 0.5
+                reward -= 1.0
                 info["action"] = "CAPTURE_FAIL_wall"
                 return reward, info
 
             if cell.resource_type:
+                if cell.owner == agent.name:
+                    reward -= 2.0  # Сильный штраф за захват своей шахты
+                    info["action"] = "CAPTURE_FAIL_own"
+                    return reward, info
                 agent.balance["imagination"] -= 10
-                old_owner = cell.owner
                 cell.owner = agent.name
-                if old_owner != agent.name:
-                    reward += 8.0  # Захват новой шахты — большая награда
-                else:
-                    reward -= 0.3  # Уже наша
+                reward += 10.0  # Большая награда за захват чужой шахты
                 info["action"] = "CAPTURE_MINE"
             else:
-                reward -= 0.3
+                reward -= 2.0  # Нет шахты — сильный штраф
                 info["action"] = "CAPTURE_FAIL_no_mine"
 
         # === BUILD (21-28) ===
@@ -543,18 +562,18 @@ class AISandboxEnv(gym.Env):
 
             build_cost = 14 if "economy_lvl_1" in agent.techs else 20
             if agent.balance["matter"] < build_cost:
-                reward -= 0.5
+                reward -= 1.0
                 info["action"] = "BUILD_FAIL_matter"
                 return reward, info
 
             cell = self.game_map.get_cell(tx, ty)
             if cell is None or cell.structure:
-                reward -= 0.5
+                reward -= 1.0
                 info["action"] = "BUILD_FAIL"
                 return reward, info
 
             if not enemy.is_dead and enemy.x == tx and enemy.y == ty:
-                reward -= 0.5
+                reward -= 1.0
                 info["action"] = "BUILD_FAIL_enemy"
                 return reward, info
 
@@ -593,7 +612,7 @@ class AISandboxEnv(gym.Env):
 
         # === PASS (38) ===
         elif action_idx == 38:
-            reward -= 0.05  # маленький штраф за бездействие
+            reward -= 0.3  # маленький штраф за бездействие
             info["action"] = "PASS"
 
         return reward, info
@@ -700,7 +719,7 @@ class AISandboxEnv(gym.Env):
                 agent.hp = 100
                 agent.x = agent.home_x
                 agent.y = agent.home_y
-                agent.balance = {"matter": 50, "energy": 50, "imagination": 50}
+                agent.balance = {"matter": 100, "energy": 100, "imagination": 100}
 
     # ----------------------------------------------------------
     # Win Conditions
