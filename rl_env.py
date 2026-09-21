@@ -55,14 +55,22 @@ TECH_TREE = {
     "logistics_lvl_3": {"cost": 1500, "parent": "logistics_lvl_2"},
 }
 
-# Маппинг: action_index → тип действия
-#  0-3:   MOVE (N, S, E, W)
-#  4-11:  ATTACK (8 смежных)
-# 12-20:  CAPTURE (9: смежные + текущая)
-# 21-28:  BUILD (8 смежных)
-# 29-37:  RESEARCH (9 технологий)
-# 38:     PASS
-NUM_ACTIONS = 39
+# Маппинг: action_index → тип действия (упрощённый)
+#  0: MOVE_TO_MINE     — двигаться к ближайшей ничейной шахте
+#  1: MOVE_TO_ENEMY    — двигаться к врагу
+#  2: MOVE_HOME        — двигаться на базу
+#  3: CAPTURE          — захватить ближайшую шахту в радиусе
+#  4: ATTACK           — атаковать врага/структуру рядом
+#  5: BUILD            — построить стену рядом
+#  6: RESEARCH         — изучить лучшую доступную технологию
+#  7: GATHER_LOOT      — двигаться к ближайшему луту
+#  8: PASS             — пропустить ход
+NUM_ACTIONS = 9
+ACTION_NAMES = [
+    "MOVE_TO_MINE", "MOVE_TO_ENEMY", "MOVE_HOME",
+    "CAPTURE", "ATTACK", "BUILD", "RESEARCH",
+    "GATHER_LOOT", "PASS"
+]
 
 
 # ============================================================
@@ -149,13 +157,16 @@ class AISandboxEnv(gym.Env):
       - Враг:  x, y, hp, matter, energy, imagination = 6
       - Технологии: 9 бинарных значений
 
-    Action (Discrete 39):
-      0-3:   MOVE N/S/E/W
-      4-11:  ATTACK (8 смежных)
-      12-20: CAPTURE (9 вокруг)
-      21-28: BUILD (8 смежных)
-      29-37: RESEARCH (9 технологий)
-      38:    PASS
+    Action (Discrete 9):
+      0: MOVE_TO_MINE  — двигаться к ближайшей шахте
+      1: MOVE_TO_ENEMY — двигаться к врагу
+      2: MOVE_HOME     — двигаться на базу
+      3: CAPTURE       — захватить шахту рядом
+      4: ATTACK        — атаковать врага/структуру
+      5: BUILD         — построить стену
+      6: RESEARCH      — изучить технологию
+      7: GATHER_LOOT   — собрать лут
+      8: PASS          — пропустить
     """
     metadata = {"render_modes": ["human", "ansi"], "render_fps": 2}
 
@@ -413,209 +424,268 @@ class AISandboxEnv(gym.Env):
 
     def _execute_action(self, agent: SimpleAgent, enemy: SimpleAgent,
                         action_idx: int) -> Tuple[float, dict]:
-        """Выполняет действие и возвращает (reward, info)."""
+        """Выполняет действие с авто-нацеливанием и возвращает (reward, info)."""
         reward = 0.0
         info = {}
+        gm = self.game_map
 
-        # === MOVE (0-3) ===
-        if 0 <= action_idx <= 3:
-            directions = [(0, -1), (0, 1), (1, 0), (-1, 0)]  # N, S, E, W
-            dx, dy = directions[action_idx]
-            move_cost = 2 if "logistics_lvl_1" in agent.techs else 5
-            if agent.balance["energy"] < move_cost:
-                reward -= 1.0  # штраф за невалидное действие
-                info["action"] = "MOVE_FAIL_energy"
-                return reward, info
+        # === 0: MOVE_TO_MINE ===
+        if action_idx == 0:
+            target = self._find_nearest_mine(agent)
+            if target is None:
+                reward -= 0.3
+                info["action"] = "MOVE_MINE_NONE"
+            else:
+                r, i = self._move_toward(agent, enemy, target.x, target.y)
+                reward += r
+                info.update(i)
+                if r >= 0:
+                    info["action"] = "MOVE_TO_MINE"
 
-            nx, ny = agent.x + dx, agent.y + dy
+        # === 1: MOVE_TO_ENEMY ===
+        elif action_idx == 1:
+            if enemy.is_dead:
+                reward -= 0.3
+                info["action"] = "MOVE_ENEMY_DEAD"
+            else:
+                r, i = self._move_toward(agent, enemy, enemy.x, enemy.y)
+                reward += r
+                info.update(i)
+                if r >= 0:
+                    info["action"] = "MOVE_TO_ENEMY"
+
+        # === 2: MOVE_HOME ===
+        elif action_idx == 2:
+            if agent.x == agent.home_x and agent.y == agent.home_y:
+                reward -= 0.1
+                info["action"] = "MOVE_HOME_ALREADY"
+            else:
+                r, i = self._move_toward(agent, enemy, agent.home_x, agent.home_y)
+                reward += r
+                info.update(i)
+                if r >= 0:
+                    info["action"] = "MOVE_HOME"
+
+        # === 3: CAPTURE ===
+        elif action_idx == 3:
+            if agent.balance["imagination"] < 10:
+                reward -= 0.5
+                info["action"] = "CAPTURE_NO_IMAG"
+            else:
+                # Ищем ближайшую чужую/ничейную шахту в радиусе 1
+                best_cell = None
+                for odx, ody in SELF_AND_ADJACENT:
+                    c = gm.get_cell(agent.x + odx, agent.y + ody)
+                    if (c and c.resource_type and c.owner != agent.name
+                            and c.structure != "wall"):
+                        if enemy.is_dead or not (enemy.x == c.x and enemy.y == c.y):
+                            best_cell = c
+                            break
+                if best_cell:
+                    agent.balance["imagination"] -= 10
+                    best_cell.owner = agent.name
+                    reward += 10.0
+                    info["action"] = "CAPTURE_MINE"
+                else:
+                    reward -= 1.0
+                    info["action"] = "CAPTURE_NO_TARGET"
+
+        # === 4: ATTACK ===
+        elif action_idx == 4:
+            if agent.balance["energy"] < 5:
+                reward -= 0.5
+                info["action"] = "ATTACK_NO_ENERGY"
+            else:
+                agent.balance["energy"] -= 5
+                dmg = 40 if "combat_lvl_1" in agent.techs else 25
+                attacked = False
+
+                # Приоритет 1: враг рядом
+                if not enemy.is_dead:
+                    dist = abs(enemy.x - agent.x) + abs(enemy.y - agent.y)
+                    if dist == 1:
+                        enemy.hp -= dmg
+                        reward += 3.0
+                        if enemy.hp <= 0:
+                            enemy.is_dead = True
+                            enemy.respawn_timer = 5
+                            cell = gm.get_cell(enemy.x, enemy.y)
+                            if cell:
+                                for res in ["matter", "energy", "imagination"]:
+                                    cell.loot[res] = cell.loot.get(res, 0) + enemy.balance[res]
+                                    enemy.balance[res] = 0
+                            reward += 20.0
+                            info["action"] = "ATTACK_KILL"
+                        else:
+                            info["action"] = f"ATTACK_HIT_{enemy.hp}hp"
+                        attacked = True
+
+                # Приоритет 2: вражеская структура / шахта рядом
+                if not attacked:
+                    for odx, ody in ADJACENT_OFFSETS:
+                        c = gm.get_cell(agent.x + odx, agent.y + ody)
+                        if c:
+                            if c.structure == "wall" and c.owner != agent.name:
+                                c.wall_hp -= dmg
+                                if c.wall_hp <= 0:
+                                    c.structure = None
+                                    c.wall_hp = 0
+                                reward += 0.5
+                                info["action"] = "ATTACK_WALL"
+                                attacked = True
+                                break
+                            elif c.resource_type and c.owner not in (agent.name, None):
+                                c.mine_hp -= dmg
+                                if c.mine_hp <= 0:
+                                    c.mine_level = max(0, c.mine_level - 1)
+                                    if c.mine_level <= 0:
+                                        c.owner = None
+                                        c.resource_type = None
+                                    else:
+                                        c.mine_hp = 50 * c.mine_level
+                                reward += 1.0
+                                info["action"] = "ATTACK_ENEMY_MINE"
+                                attacked = True
+                                break
+
+                if not attacked:
+                    reward -= 0.5
+                    info["action"] = "ATTACK_NO_TARGET"
+
+        # === 5: BUILD ===
+        elif action_idx == 5:
+            build_cost = 14 if "economy_lvl_1" in agent.techs else 20
+            if agent.balance["matter"] < build_cost:
+                reward -= 0.5
+                info["action"] = "BUILD_NO_MATTER"
+            else:
+                built = False
+                for odx, ody in ADJACENT_OFFSETS:
+                    c = gm.get_cell(agent.x + odx, agent.y + ody)
+                    if (c and c.structure is None and c.resource_type is None
+                            and (enemy.is_dead or not (enemy.x == c.x and enemy.y == c.y))):
+                        agent.balance["matter"] -= build_cost
+                        c.structure = "wall"
+                        c.wall_hp = 100
+                        c.owner = agent.name
+                        reward += 1.0
+                        info["action"] = "BUILD_WALL"
+                        built = True
+                        break
+                if not built:
+                    reward -= 0.5
+                    info["action"] = "BUILD_NO_SPACE"
+
+        # === 6: RESEARCH ===
+        elif action_idx == 6:
+            researched = False
+            # Приоритет: economy → combat → logistics, по уровням
+            priority = [
+                "economy_lvl_1", "combat_lvl_1", "logistics_lvl_1",
+                "economy_lvl_2", "combat_lvl_2", "logistics_lvl_2",
+                "economy_lvl_3", "combat_lvl_3", "logistics_lvl_3",
+            ]
+            for tech_name in priority:
+                if tech_name in agent.techs:
+                    continue
+                td = TECH_TREE[tech_name]
+                if td["parent"] and td["parent"] not in agent.techs:
+                    continue
+                if agent.balance["imagination"] < td["cost"]:
+                    continue
+                agent.balance["imagination"] -= td["cost"]
+                agent.techs.append(tech_name)
+                reward += 5.0
+                info["action"] = f"RESEARCH_{tech_name}"
+                researched = True
+                break
+            if not researched:
+                reward -= 0.3
+                info["action"] = "RESEARCH_NONE"
+
+        # === 7: GATHER_LOOT ===
+        elif action_idx == 7:
+            # Двигаться к ближайшему луту
+            best_cell = None
+            best_dist = 999
+            for row in gm.grid:
+                for cell in row:
+                    if any(v > 0 for v in cell.loot.values()):
+                        dist = abs(cell.x - agent.x) + abs(cell.y - agent.y)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_cell = cell
+            if best_cell:
+                r, i = self._move_toward(agent, enemy, best_cell.x, best_cell.y)
+                reward += r
+                info.update(i)
+                if r >= 0:
+                    info["action"] = "GATHER_LOOT"
+            else:
+                reward -= 0.3
+                info["action"] = "GATHER_NO_LOOT"
+
+        # === 8: PASS ===
+        elif action_idx == 8:
+            reward -= 0.3
+            info["action"] = "PASS"
+
+        return reward, info
+
+    def _move_toward(self, agent: SimpleAgent, enemy: SimpleAgent,
+                     tx: int, ty: int) -> Tuple[float, dict]:
+        """Двигает агента на 1 клетку к цели. Возвращает (reward, info)."""
+        move_cost = 2 if "logistics_lvl_1" in agent.techs else 5
+        if agent.balance["energy"] < move_cost:
+            return -0.5, {"action": "MOVE_NO_ENERGY"}
+
+        dx = int(np.sign(tx - agent.x))
+        dy = int(np.sign(ty - agent.y))
+
+        # Пробуем X, потом Y
+        moves = []
+        if dx != 0:
+            moves.append((agent.x + dx, agent.y))
+        if dy != 0:
+            moves.append((agent.x, agent.y + dy))
+        if not moves:
+            return -0.1, {"action": "MOVE_ALREADY_THERE"}
+
+        for nx, ny in moves:
             cell = self.game_map.get_cell(nx, ny)
             if cell is None:
-                reward -= 0.5
-                info["action"] = "MOVE_FAIL_bounds"
-                return reward, info
+                continue
             if cell.structure == "wall":
-                reward -= 0.5
-                info["action"] = "MOVE_FAIL_wall"
-                return reward, info
+                continue
             if not enemy.is_dead and enemy.x == nx and enemy.y == ny:
-                reward -= 0.5
-                info["action"] = "MOVE_FAIL_enemy"
-                return reward, info
-
+                continue
+            # Успешный ход
             agent.balance["energy"] -= move_cost
             agent.x = nx
             agent.y = ny
-
+            reward = 0.0
             # Подбор лута
             for res in ["matter", "energy", "imagination"]:
                 if cell.loot.get(res, 0) > 0:
                     agent.balance[res] += cell.loot[res]
                     reward += 2.0
                     cell.loot[res] = 0
+            return reward, {"action": "MOVE"}
 
-            info["action"] = f"MOVE_{['N','S','E','W'][action_idx]}"
+        return -0.3, {"action": "MOVE_BLOCKED"}
 
-        # === ATTACK (4-11) ===
-        elif 4 <= action_idx <= 11:
-            offset_idx = action_idx - 4
-            odx, ody = ADJACENT_OFFSETS[offset_idx]
-            tx, ty = agent.x + odx, agent.y + ody
-
-            if agent.balance["energy"] < 5:
-                reward -= 0.5
-                info["action"] = "ATTACK_FAIL_energy"
-                return reward, info
-
-            agent.balance["energy"] -= 5
-            cell = self.game_map.get_cell(tx, ty)
-
-            if cell is None:
-                reward -= 0.5
-                info["action"] = "ATTACK_FAIL_bounds"
-                return reward, info
-
-            dmg = 40 if "combat_lvl_1" in agent.techs else 25
-
-            # Атака врага
-            if not enemy.is_dead and enemy.x == tx and enemy.y == ty:
-                enemy.hp -= dmg
-                reward += 3.0
-                if enemy.hp <= 0:
-                    enemy.is_dead = True
-                    enemy.respawn_timer = 5
-                    for res in ["matter", "energy", "imagination"]:
-                        cell.loot[res] = cell.loot.get(res, 0) + enemy.balance[res]
-                        enemy.balance[res] = 0
-                    reward += 20.0
-                    info["action"] = "ATTACK_KILL"
-                else:
-                    info["action"] = f"ATTACK_HIT_{enemy.hp}hp"
-            # Атака стены
-            elif cell.structure == "wall":
-                cell.wall_hp -= dmg
-                if cell.wall_hp <= 0:
-                    cell.structure = None
-                    cell.wall_hp = 0
-                reward += 0.5
-                info["action"] = "ATTACK_WALL"
-            # Атака шахты
-            elif cell.resource_type and cell.owner != agent.name:
-                cell.mine_hp -= dmg
-                if cell.mine_hp <= 0:
-                    cell.mine_level = max(0, cell.mine_level - 1)
-                    if cell.mine_level <= 0:
-                        cell.owner = None
-                        cell.resource_type = None
-                    else:
-                        cell.mine_hp = 50 * cell.mine_level
-                reward += 1.0
-                info["action"] = "ATTACK_MINE"
-            else:
-                reward -= 0.3
-                info["action"] = "ATTACK_EMPTY"
-
-        # === CAPTURE (12-20) ===
-        elif 12 <= action_idx <= 20:
-            offset_idx = action_idx - 12
-            odx, ody = SELF_AND_ADJACENT[offset_idx]
-            tx, ty = agent.x + odx, agent.y + ody
-
-            if agent.balance["imagination"] < 10:
-                reward -= 1.0
-                info["action"] = "CAPTURE_FAIL_imag"
-                return reward, info
-
-            cell = self.game_map.get_cell(tx, ty)
-            if cell is None:
-                reward -= 1.0
-                info["action"] = "CAPTURE_FAIL_bounds"
-                return reward, info
-
-            if not enemy.is_dead and enemy.x == tx and enemy.y == ty:
-                reward -= 1.0
-                info["action"] = "CAPTURE_FAIL_enemy"
-                return reward, info
-
-            if cell.structure == "wall":
-                reward -= 1.0
-                info["action"] = "CAPTURE_FAIL_wall"
-                return reward, info
-
-            if cell.resource_type:
-                if cell.owner == agent.name:
-                    reward -= 2.0  # Сильный штраф за захват своей шахты
-                    info["action"] = "CAPTURE_FAIL_own"
-                    return reward, info
-                agent.balance["imagination"] -= 10
-                cell.owner = agent.name
-                reward += 10.0  # Большая награда за захват чужой шахты
-                info["action"] = "CAPTURE_MINE"
-            else:
-                reward -= 2.0  # Нет шахты — сильный штраф
-                info["action"] = "CAPTURE_FAIL_no_mine"
-
-        # === BUILD (21-28) ===
-        elif 21 <= action_idx <= 28:
-            offset_idx = action_idx - 21
-            odx, ody = ADJACENT_OFFSETS[offset_idx]
-            tx, ty = agent.x + odx, agent.y + ody
-
-            build_cost = 14 if "economy_lvl_1" in agent.techs else 20
-            if agent.balance["matter"] < build_cost:
-                reward -= 1.0
-                info["action"] = "BUILD_FAIL_matter"
-                return reward, info
-
-            cell = self.game_map.get_cell(tx, ty)
-            if cell is None or cell.structure:
-                reward -= 1.0
-                info["action"] = "BUILD_FAIL"
-                return reward, info
-
-            if not enemy.is_dead and enemy.x == tx and enemy.y == ty:
-                reward -= 1.0
-                info["action"] = "BUILD_FAIL_enemy"
-                return reward, info
-
-            agent.balance["matter"] -= build_cost
-            cell.structure = "wall"
-            cell.wall_hp = 100
-            cell.owner = agent.name
-            reward += 1.0
-            info["action"] = "BUILD_WALL"
-
-        # === RESEARCH (29-37) ===
-        elif 29 <= action_idx <= 37:
-            tech_idx = action_idx - 29
-            tech_name = TECH_NAMES[tech_idx]
-            tech_data = TECH_TREE[tech_name]
-
-            if tech_name in agent.techs:
-                reward -= 0.5
-                info["action"] = "RESEARCH_FAIL_done"
-                return reward, info
-
-            if tech_data["parent"] and tech_data["parent"] not in agent.techs:
-                reward -= 0.5
-                info["action"] = "RESEARCH_FAIL_parent"
-                return reward, info
-
-            if agent.balance["imagination"] < tech_data["cost"]:
-                reward -= 0.5
-                info["action"] = "RESEARCH_FAIL_cost"
-                return reward, info
-
-            agent.balance["imagination"] -= tech_data["cost"]
-            agent.techs.append(tech_name)
-            reward += 5.0
-            info["action"] = f"RESEARCH_{tech_name}"
-
-        # === PASS (38) ===
-        elif action_idx == 38:
-            reward -= 0.3  # маленький штраф за бездействие
-            info["action"] = "PASS"
-
-        return reward, info
+    def _find_nearest_mine(self, agent: SimpleAgent) -> Optional[SimpleCell]:
+        """Находит ближайшую ничейную/вражескую шахту."""
+        best_dist = 999
+        best_cell = None
+        for row in self.game_map.grid:
+            for cell in row:
+                if cell.resource_type and cell.owner != agent.name:
+                    dist = abs(cell.x - agent.x) + abs(cell.y - agent.y)
+                    if dist < best_dist:
+                        best_dist = dist
+                        best_cell = cell
+        return best_cell
 
     # ----------------------------------------------------------
     # Bot Logic (простой rule-based противник)
