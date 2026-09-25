@@ -692,9 +692,13 @@ class AISandboxEnv(gym.Env):
     # ----------------------------------------------------------
 
     def _bot_step(self):
-        """Простой бот: идёт к ближайшей ничейной шахте и захватывает."""
+        """Ослабленный бот: 50% шанс пропуска хода."""
         bot = self.bot
         gm = self.game_map
+
+        # 50% шанс пропустить ход (бот "думает")
+        if self.np_random.random() < 0.5:
+            return
 
         # 1) Если рядом есть ничейная шахта — захватить
         for dx in range(-1, 2):
@@ -723,7 +727,6 @@ class AISandboxEnv(gym.Env):
             dx = int(np.sign(best_cell.x - bot.x))
             dy = int(np.sign(best_cell.y - bot.y))
 
-            # Пробуем два варианта движения (X, потом Y)
             moves_to_try = []
             if dx != 0:
                 moves_to_try.append((bot.x + dx, bot.y))
@@ -737,12 +740,11 @@ class AISandboxEnv(gym.Env):
                         bot.balance["energy"] -= 5
                         bot.x = nx
                         bot.y = ny
-                        # Подбор лута
                         for res in ["matter", "energy", "imagination"]:
                             if target.loot.get(res, 0) > 0:
                                 bot.balance[res] += target.loot[res]
                                 target.loot[res] = 0
-                        break  # Успешно двинулись
+                        break
 
     # ----------------------------------------------------------
     # Income & Hunger
@@ -753,11 +755,11 @@ class AISandboxEnv(gym.Env):
         if agent.is_dead:
             return
 
-        # Доход от владеемых шахт: +5 × уровень
+        # Доход от владеемых шахт: +10 × уровень
         for row in self.game_map.grid:
             for cell in row:
                 if cell.resource_type and cell.owner == agent.name:
-                    income = 5 * cell.mine_level
+                    income = 10 * cell.mine_level
                     agent.balance[cell.resource_type] += income
 
         # Голод: -N энергии за ход
@@ -801,15 +803,15 @@ class AISandboxEnv(gym.Env):
             name = agent.name
             bal = agent.balance
 
-            # Singularity: 1000 каждого ресурса (снижено для 500 шагов)
-            if bal["matter"] >= 1000 and bal["energy"] >= 1000 and bal["imagination"] >= 1000:
+            # Singularity: 500 каждого ресурса (достижимо за 200-300 ходов)
+            if bal["matter"] >= 500 and bal["energy"] >= 500 and bal["imagination"] >= 500:
                 return name
 
-            # Monopoly: 7+ из 9 шахт (78%)
+            # Monopoly: 5+ из 9 шахт (больше половины)
             total = self.game_map.total_mines()
             if total > 0:
                 owned = self.game_map.count_mines_owned_by(name)
-                if owned >= 7:
+                if owned >= 5:
                     return name
 
         return None

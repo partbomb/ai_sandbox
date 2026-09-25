@@ -15,18 +15,7 @@ import numpy as np
 
 from stable_baselines3 import PPO, DQN
 
-from rl_env import AISandboxEnv, NUM_ACTIONS
-
-
-# Названия действий для лога
-ACTION_NAMES = (
-    ["MOVE_N", "MOVE_S", "MOVE_E", "MOVE_W"]
-    + [f"ATTACK_{i}" for i in range(8)]
-    + [f"CAPTURE_{i}" for i in range(9)]
-    + [f"BUILD_{i}" for i in range(8)]
-    + [f"RESEARCH_{i}" for i in range(9)]
-    + ["PASS"]
-)
+from rl_env import AISandboxEnv, NUM_ACTIONS, ACTION_NAMES
 
 
 def play(model_path: str, episodes: int = 5, render: bool = True):
