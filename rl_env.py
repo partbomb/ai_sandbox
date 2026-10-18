@@ -4,8 +4,17 @@ rl_env.py — Gymnasium-среда для обучения RL-агента в AI
 Среда оборачивает логику игры (карта 7×7, ресурсы, бой, захват шахт)
 в стандартный интерфейс Gymnasium для Stable-Baselines3.
 
-Пространство наблюдений: плоский вектор float32 (315 элементов)
-Пространство действий:   Discrete(39)
+Пространство наблюдений: плоский вектор float32 (324 элемента)
+  294 (карта) + 6 (игрок) + 6 (враг) + 9 (тех) + 9 (подсказки) = 324
+Пространство действий:   Discrete(9)
+
+ИСПРАВЛЕНО (v2):
+  1. Суицидальный эксплойт убран: игрок НЕ бросает лут при смерти от голода
+  2. BUILD больше не даёт халявный +1.0; требует 2+ шахты
+  3. Штраф в _shaped_reward() при захвате шахты теперь пропускается
+  4. MOVE_HOME заменён на MOVE_TO_ENERGY_MINE
+  5. _move_toward() умеет обходить стены (перпендикулярные кандидаты)
+  6. Вектор наблюдений расширен 9 подсказками
 """
 
 import gymnasium as gym
@@ -55,19 +64,19 @@ TECH_TREE = {
     "logistics_lvl_3": {"cost": 1500, "parent": "logistics_lvl_2"},
 }
 
-# Маппинг: action_index → тип действия (упрощённый)
-#  0: MOVE_TO_MINE     — двигаться к ближайшей ничейной шахте
-#  1: MOVE_TO_ENEMY    — двигаться к врагу
-#  2: MOVE_HOME        — двигаться на базу
-#  3: CAPTURE          — захватить ближайшую шахту в радиусе
-#  4: ATTACK           — атаковать врага/структуру рядом
-#  5: BUILD            — построить стену рядом
-#  6: RESEARCH         — изучить лучшую доступную технологию
-#  7: GATHER_LOOT      — двигаться к ближайшему луту
-#  8: PASS             — пропустить ход
+# Маппинг: action_index → тип действия
+#  0: MOVE_TO_MINE          — двигаться к ближайшей ничейной шахте (любой)
+#  1: MOVE_TO_ENEMY         — двигаться к врагу
+#  2: MOVE_TO_ENERGY_MINE   — двигаться к ближайшей энергетической шахте
+#  3: CAPTURE               — захватить ближайшую шахту в радиусе
+#  4: ATTACK                — атаковать врага/структуру рядом
+#  5: BUILD                 — построить стену рядом (требует 2+ шахты)
+#  6: RESEARCH              — изучить лучшую доступную технологию
+#  7: GATHER_LOOT           — двигаться к ближайшему луту
+#  8: PASS                  — пропустить ход
 NUM_ACTIONS = 9
 ACTION_NAMES = [
-    "MOVE_TO_MINE", "MOVE_TO_ENEMY", "MOVE_HOME",
+    "MOVE_TO_MINE", "MOVE_TO_ENEMY", "MOVE_TO_ENERGY_MINE",
     "CAPTURE", "ATTACK", "BUILD", "RESEARCH",
     "GATHER_LOOT", "PASS"
 ]
@@ -148,25 +157,27 @@ class SimpleMap:
 
 class AISandboxEnv(gym.Env):
     """
-    RL-среда AI Sandbox.
+    RL-среда AI Sandbox (v2 — исправленные баги).
 
-    Observation (315 float32):
+    Observation (324 float32):
       - Карта 7×7 × 6 каналов = 294
         Каналы: owner, has_resource, resource_type, mine_level, structure, has_loot
       - Агент: x, y, hp, matter, energy, imagination = 6
       - Враг:  x, y, hp, matter, energy, imagination = 6
       - Технологии: 9 бинарных значений
+      - Подсказки: 9 значений (dx_mine, dy_mine, dx_energy, dy_energy,
+                               dx_enemy, dy_enemy, can_capture, can_attack, has_loot_nearby)
 
     Action (Discrete 9):
-      0: MOVE_TO_MINE  — двигаться к ближайшей шахте
-      1: MOVE_TO_ENEMY — двигаться к врагу
-      2: MOVE_HOME     — двигаться на базу
-      3: CAPTURE       — захватить шахту рядом
-      4: ATTACK        — атаковать врага/структуру
-      5: BUILD         — построить стену
-      6: RESEARCH      — изучить технологию
-      7: GATHER_LOOT   — собрать лут
-      8: PASS          — пропустить
+      0: MOVE_TO_MINE        — ближайшая любая шахта
+      1: MOVE_TO_ENEMY       — к врагу
+      2: MOVE_TO_ENERGY_MINE — к энергетической шахте (спасение от голода!)
+      3: CAPTURE             — захватить шахту рядом
+      4: ATTACK              — атаковать врага/структуру
+      5: BUILD               — построить стену (требует 2+ шахты)
+      6: RESEARCH            — изучить технологию
+      7: GATHER_LOOT         — собрать лут
+      8: PASS                — пропустить
     """
     metadata = {"render_modes": ["human", "ansi"], "render_fps": 2}
 
@@ -176,7 +187,8 @@ class AISandboxEnv(gym.Env):
         self.max_steps = max_steps
         self.hunger = hunger
 
-        obs_size = MAP_SIZE * MAP_SIZE * 6 + 6 + 6 + 9  # = 315
+        # 294 (карта) + 6 (игрок) + 6 (враг) + 9 (тех) + 9 (подсказки) = 324
+        obs_size = MAP_SIZE * MAP_SIZE * 6 + 6 + 6 + 9 + 9
         self.observation_space = spaces.Box(
             low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32
         )
@@ -191,6 +203,7 @@ class AISandboxEnv(gym.Env):
         # Tracking для shaped rewards
         self._prev_mines_owned = 0
         self._prev_total_resources = 0
+        self._prev_dist_to_mine = 0.0
 
     # ----------------------------------------------------------
     # Gymnasium API
@@ -220,25 +233,37 @@ class AISandboxEnv(gym.Env):
         info = {}
         self.steps += 1
 
+        was_alive = not self.player.is_dead
+
         # 1) Ход игрока
         if not self.player.is_dead:
             r, i = self._execute_action(self.player, self.bot, action)
             reward += r
             info.update(i)
         else:
-            reward -= 1.0  # Сильный штраф за нахождение в мёртвом состоянии
+            reward -= 0.5  # Ждём возрождения
 
         # 2) Ход бота
         if not self.bot.is_dead:
             self._bot_step()
 
         # 3) Доход от шахт + голод
-        self._apply_income(self.player)
-        self._apply_income(self.bot)
+        # FIX #1: игрок НЕ бросает лут при смерти от голода (убираем эксплойт)
+        self._apply_income(self.player, drop_loot_on_starve=False)
+        self._apply_income(self.bot, drop_loot_on_starve=True)
+
+        # Большой штраф за смерть от голода
+        if was_alive and self.player.is_dead:
+            reward -= 15.0
 
         # 4) Респаун мёртвых
+        player_was_dead = self.player.is_dead
         self._handle_respawn(self.player)
         self._handle_respawn(self.bot)
+        # После респауна сбрасываем трекеры, чтобы не было ложной награды за стартовые ресурсы
+        if player_was_dead and not self.player.is_dead:
+            self._prev_total_resources = sum(self.player.balance.values())
+            self._prev_dist_to_mine = self._dist_to_nearest_mine(self.player)
 
         # 5) Проверка победы
         win = self._check_win()
@@ -259,11 +284,10 @@ class AISandboxEnv(gym.Env):
         if self.steps >= self.max_steps:
             truncated = True
             info["result"] = info.get("result", "TIMEOUT")
-            # Бонус/штраф в конце по позиции
             mines_player = self.game_map.count_mines_owned_by("player")
             mines_bot = self.game_map.count_mines_owned_by("bot")
             if mines_player > mines_bot:
-                reward += 20.0  # Контролируем больше шахт
+                reward += 20.0
             elif mines_player < mines_bot:
                 reward -= 10.0
 
@@ -280,45 +304,57 @@ class AISandboxEnv(gym.Env):
         mines_now = self.game_map.count_mines_owned_by("player")
         mine_delta = mines_now - self._prev_mines_owned
         if mine_delta > 0:
-            shaped += 5.0 * mine_delta   # +5 за каждую новую шахту
+            shaped += 8.0 * mine_delta   # +8 за каждую новую шахту
         elif mine_delta < 0:
-            shaped += 3.0 * mine_delta   # -3 за потерю шахты
-        self._prev_mines_owned = mines_now
+            shaped += 4.0 * mine_delta   # -4 за потерю шахты
 
-        # 2) Награда за рост общих ресурсов (маленький бонус)
-        total_res = sum(self.player.balance.values())
-        res_delta = total_res - self._prev_total_resources
-        if res_delta > 0:
-            shaped += min(res_delta * 0.02, 1.5)  # Макс +1.5 за ход
-        self._prev_total_resources = total_res
+        # 2) Пассивный бонус за удержание шахт; энергетическая особенно важна
+        energy_mines = sum(
+            1 for row in self.game_map.grid for c in row
+            if c.resource_type == "energy" and c.owner == "player"
+        )
+        shaped += 0.15 * mines_now + (0.25 if energy_mines > 0 else -0.1)
 
-        # 3) Навигационная награда — ближе к шахте = лучше
+        # 3) Навигационная награда — ТОЛЬКО если число шахт не изменилось!
+        # FIX #3: при захвате шахты mine_delta != 0, поэтому пропускаем этот блок,
+        # чтобы не получать штраф за "прыжок" расстояния на следующую шахту.
         if not self.player.is_dead:
             dist_now = self._dist_to_nearest_mine(self.player)
-            dist_delta = self._prev_dist_to_mine - dist_now  # + если приближаемся
-            shaped += dist_delta * 0.5  # +0.5 за каждую клетку приближения
+            if mine_delta == 0:
+                dist_delta = self._prev_dist_to_mine - dist_now
+                shaped += np.clip(dist_delta * 0.4, -1.0, 1.0)
             self._prev_dist_to_mine = dist_now
 
-        # 4) Штраф за простой (0 шахт после 30 шагов)
-        if self.steps > 30 and mines_now == 0:
-            shaped -= 0.2
+        self._prev_mines_owned = mines_now
 
-        # 5) Бонус за выживание
+        # 4) Награда за реальный прирост ресурсов (от дохода шахт)
         if not self.player.is_dead:
-            shaped += 0.05
+            total_res = sum(self.player.balance.values())
+            res_delta = total_res - self._prev_total_resources
+            if res_delta > 0:
+                shaped += min(res_delta * 0.01, 0.5)  # Макс +0.5 за ход
+            self._prev_total_resources = total_res
 
         return shaped
 
-    def _dist_to_nearest_mine(self, agent: SimpleAgent) -> float:
-        """Manhattan расстояние до ближайшей ничейной шахты."""
-        best_dist = MAP_SIZE * 2  # максимальное возможное
+    def _dist_to_nearest_mine(self, agent: SimpleAgent, res_type: Optional[str] = None) -> float:
+        """Manhattan расстояние до ближайшей ничейной/вражеской шахты.
+        
+        Args:
+            agent: агент
+            res_type: тип ресурса ('energy', 'matter', 'imagination') или None (любая)
+        """
+        best_dist = MAP_SIZE * 2
+        found = False
         for row in self.game_map.grid:
             for cell in row:
                 if cell.resource_type and cell.owner != agent.name:
-                    dist = abs(cell.x - agent.x) + abs(cell.y - agent.y)
-                    if dist < best_dist:
-                        best_dist = dist
-        return best_dist
+                    if res_type is None or cell.resource_type == res_type:
+                        dist = abs(cell.x - agent.x) + abs(cell.y - agent.y)
+                        if dist < best_dist:
+                            best_dist = dist
+                            found = True
+        return best_dist if found else 0.0
 
     def render(self):
         """ASCII-визуализация карты."""
@@ -360,7 +396,7 @@ class AISandboxEnv(gym.Env):
     # ----------------------------------------------------------
 
     def _get_obs(self) -> np.ndarray:
-        """Конвертирует состояние игры в плоский вектор [0..1]."""
+        """Конвертирует состояние игры в плоский вектор [0..1] (324 элемента)."""
         obs = []
 
         # Map channels: 7×7 × 6 = 294
@@ -415,6 +451,56 @@ class AISandboxEnv(gym.Env):
         for tech in TECH_NAMES:
             obs.append(1.0 if tech in self.player.techs else 0.0)
 
+        # FIX #5: Подсказки (9 значений) — помогаем маленькой MLP-сети ориентироваться
+        # dx/dy к ближайшей любой шахте
+        nearest_mine = self._find_nearest_mine(self.player)
+        if nearest_mine:
+            obs.append((nearest_mine.x - self.player.x + MAP_SIZE) / (2 * MAP_SIZE))
+            obs.append((nearest_mine.y - self.player.y + MAP_SIZE) / (2 * MAP_SIZE))
+        else:
+            obs.append(0.5); obs.append(0.5)
+
+        # dx/dy к ближайшей энергетической шахте
+        energy_mine = self._find_nearest_mine(self.player, res_type="energy")
+        if energy_mine:
+            obs.append((energy_mine.x - self.player.x + MAP_SIZE) / (2 * MAP_SIZE))
+            obs.append((energy_mine.y - self.player.y + MAP_SIZE) / (2 * MAP_SIZE))
+        else:
+            obs.append(0.5); obs.append(0.5)
+
+        # dx/dy к врагу
+        if not self.bot.is_dead:
+            obs.append((self.bot.x - self.player.x + MAP_SIZE) / (2 * MAP_SIZE))
+            obs.append((self.bot.y - self.player.y + MAP_SIZE) / (2 * MAP_SIZE))
+        else:
+            obs.append(0.5); obs.append(0.5)
+
+        # can_capture: есть ли шахта рядом?
+        can_capture = 0.0
+        for odx, ody in SELF_AND_ADJACENT:
+            c = self.game_map.get_cell(self.player.x + odx, self.player.y + ody)
+            if c and c.resource_type and c.owner != "player":
+                can_capture = 1.0
+                break
+        obs.append(can_capture)
+
+        # can_attack: враг рядом?
+        can_attack = 0.0
+        if not self.bot.is_dead:
+            dist = abs(self.bot.x - self.player.x) + abs(self.bot.y - self.player.y)
+            if dist <= 1:
+                can_attack = 1.0
+        obs.append(can_attack)
+
+        # has_loot_nearby: есть лут рядом?
+        has_loot_nearby = 0.0
+        for odx, ody in SELF_AND_ADJACENT:
+            c = self.game_map.get_cell(self.player.x + odx, self.player.y + ody)
+            if c and any(v > 0 for v in c.loot.values()):
+                has_loot_nearby = 1.0
+                break
+        obs.append(has_loot_nearby)
+
         obs = np.clip(obs, 0.0, 1.0)
         return np.array(obs, dtype=np.float32)
 
@@ -454,17 +540,18 @@ class AISandboxEnv(gym.Env):
                 if r >= 0:
                     info["action"] = "MOVE_TO_ENEMY"
 
-        # === 2: MOVE_HOME ===
+        # === 2: MOVE_TO_ENERGY_MINE (FIX #4: заменяем бесполезный MOVE_HOME) ===
         elif action_idx == 2:
-            if agent.x == agent.home_x and agent.y == agent.home_y:
-                reward -= 0.1
-                info["action"] = "MOVE_HOME_ALREADY"
+            target = self._find_nearest_mine(agent, res_type="energy")
+            if target is None:
+                reward -= 0.3
+                info["action"] = "MOVE_ENERGY_NONE"
             else:
-                r, i = self._move_toward(agent, enemy, agent.home_x, agent.home_y)
+                r, i = self._move_toward(agent, enemy, target.x, target.y)
                 reward += r
                 info.update(i)
                 if r >= 0:
-                    info["action"] = "MOVE_HOME"
+                    info["action"] = "MOVE_TO_ENERGY_MINE"
 
         # === 3: CAPTURE ===
         elif action_idx == 3:
@@ -472,22 +559,26 @@ class AISandboxEnv(gym.Env):
                 reward -= 0.5
                 info["action"] = "CAPTURE_NO_IMAG"
             else:
-                # Ищем ближайшую чужую/ничейную шахту в радиусе 1
                 best_cell = None
+                # Приоритет: сначала ищем энергетическую шахту (важнее для выживания)
                 for odx, ody in SELF_AND_ADJACENT:
                     c = gm.get_cell(agent.x + odx, agent.y + ody)
                     if (c and c.resource_type and c.owner != agent.name
                             and c.structure != "wall"):
                         if enemy.is_dead or not (enemy.x == c.x and enemy.y == c.y):
-                            best_cell = c
-                            break
+                            if best_cell is None:
+                                best_cell = c
+                            if c.resource_type == "energy":  # Энергетическая = приоритет
+                                best_cell = c
+                                break
                 if best_cell:
                     agent.balance["imagination"] -= 10
                     best_cell.owner = agent.name
-                    reward += 10.0
+                    # Энергетическая шахта ценнее — даём больше награды
+                    reward += 15.0 if best_cell.resource_type == "energy" else 10.0
                     info["action"] = "CAPTURE_MINE"
                 else:
-                    reward -= 1.0
+                    reward -= 0.5
                     info["action"] = "CAPTURE_NO_TARGET"
 
         # === 4: ATTACK ===
@@ -552,12 +643,13 @@ class AISandboxEnv(gym.Env):
                     reward -= 0.5
                     info["action"] = "ATTACK_NO_TARGET"
 
-        # === 5: BUILD ===
+        # === 5: BUILD (FIX #2: убрана халявная награда; требует 2+ шахты) ===
         elif action_idx == 5:
             build_cost = 14 if "economy_lvl_1" in agent.techs else 20
-            if agent.balance["matter"] < build_cost:
+            mines_owned = self.game_map.count_mines_owned_by(agent.name)
+            if agent.balance["matter"] < build_cost or mines_owned < 2:
                 reward -= 0.5
-                info["action"] = "BUILD_NO_MATTER"
+                info["action"] = "BUILD_INVALID"
             else:
                 built = False
                 for odx, ody in ADJACENT_OFFSETS:
@@ -568,7 +660,7 @@ class AISandboxEnv(gym.Env):
                         c.structure = "wall"
                         c.wall_hp = 100
                         c.owner = agent.name
-                        reward += 1.0
+                        reward -= 0.1  # Небольшая цена за трату хода, не бонус!
                         info["action"] = "BUILD_WALL"
                         built = True
                         break
@@ -627,14 +719,21 @@ class AISandboxEnv(gym.Env):
 
         # === 8: PASS ===
         elif action_idx == 8:
-            reward -= 0.3
+            # PASS оправдан только если агент уже владеет шахтами и копит ресурсы
+            if self.game_map.count_mines_owned_by(agent.name) >= 3:
+                reward += 0.1
+            else:
+                reward -= 0.5
             info["action"] = "PASS"
 
         return reward, info
 
     def _move_toward(self, agent: SimpleAgent, enemy: SimpleAgent,
                      tx: int, ty: int) -> Tuple[float, dict]:
-        """Двигает агента на 1 клетку к цели. Возвращает (reward, info)."""
+        """Двигает агента на 1 клетку к цели. Возвращает (reward, info).
+        
+        FIX #4: Добавлены перпендикулярные кандидаты для обхода стен.
+        """
         move_cost = 2 if "logistics_lvl_1" in agent.techs else 5
         if agent.balance["energy"] < move_cost:
             return -0.5, {"action": "MOVE_NO_ENERGY"}
@@ -642,16 +741,22 @@ class AISandboxEnv(gym.Env):
         dx = int(np.sign(tx - agent.x))
         dy = int(np.sign(ty - agent.y))
 
-        # Пробуем X, потом Y
-        moves = []
-        if dx != 0:
-            moves.append((agent.x + dx, agent.y))
-        if dy != 0:
-            moves.append((agent.x, agent.y + dy))
-        if not moves:
-            return -0.1, {"action": "MOVE_ALREADY_THERE"}
+        if dx == 0 and dy == 0:
+            return -0.2, {"action": "MOVE_ALREADY_THERE"}
 
-        for nx, ny in moves:
+        # Прямые шаги к цели
+        candidates = []
+        if dx != 0:
+            candidates.append((agent.x + dx, agent.y))
+        if dy != 0:
+            candidates.append((agent.x, agent.y + dy))
+        # FIX #4: Перпендикулярный обход, если путь перекрыт стеной
+        if dx == 0:  # Двигаемся только вертикально — добавим горизонтальные обходы
+            candidates.extend([(agent.x + 1, agent.y), (agent.x - 1, agent.y)])
+        if dy == 0:  # Двигаемся только горизонтально — добавим вертикальные обходы
+            candidates.extend([(agent.x, agent.y + 1), (agent.x, agent.y - 1)])
+
+        for nx, ny in candidates:
             cell = self.game_map.get_cell(nx, ny)
             if cell is None:
                 continue
@@ -664,27 +769,36 @@ class AISandboxEnv(gym.Env):
             agent.x = nx
             agent.y = ny
             reward = 0.0
-            # Подбор лута
+            # Подбор лута при перемещении (без +2.0 бонуса — убираем привлекательность лута)
             for res in ["matter", "energy", "imagination"]:
                 if cell.loot.get(res, 0) > 0:
                     agent.balance[res] += cell.loot[res]
-                    reward += 2.0
+                    reward += 1.0  # Умеренная награда (было 2.0)
                     cell.loot[res] = 0
             return reward, {"action": "MOVE"}
 
         return -0.3, {"action": "MOVE_BLOCKED"}
 
-    def _find_nearest_mine(self, agent: SimpleAgent) -> Optional[SimpleCell]:
-        """Находит ближайшую ничейную/вражескую шахту."""
+    def _find_nearest_mine(self, agent: SimpleAgent, res_type: Optional[str] = None) -> Optional[SimpleCell]:
+        """Находит ближайшую ничейную/вражескую шахту.
+        
+        Args:
+            agent: агент
+            res_type: тип ресурса ('energy', 'matter', 'imagination') или None (любая)
+        """
         best_dist = 999
         best_cell = None
         for row in self.game_map.grid:
             for cell in row:
                 if cell.resource_type and cell.owner != agent.name:
-                    dist = abs(cell.x - agent.x) + abs(cell.y - agent.y)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_cell = cell
+                    if res_type is None or cell.resource_type == res_type:
+                        dist = abs(cell.x - agent.x) + abs(cell.y - agent.y)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_cell = cell
+        # FIX #4: Если нужного типа нет, ищем любую доступную шахту
+        if best_cell is None and res_type is not None:
+            return self._find_nearest_mine(agent, res_type=None)
         return best_cell
 
     # ----------------------------------------------------------
@@ -750,8 +864,14 @@ class AISandboxEnv(gym.Env):
     # Income & Hunger
     # ----------------------------------------------------------
 
-    def _apply_income(self, agent: SimpleAgent):
-        """Начисляет доход от шахт и отнимает голод."""
+    def _apply_income(self, agent: SimpleAgent, drop_loot_on_starve: bool = False):
+        """Начисляет доход от шахт и отнимает голод.
+        
+        Args:
+            agent: агент
+            drop_loot_on_starve: если True — бросает ресурсы при смерти от голода.
+                                 FIX #1: для игрока = False (убирает суицидальный эксплойт).
+        """
         if agent.is_dead:
             return
 
@@ -770,13 +890,14 @@ class AISandboxEnv(gym.Env):
             agent.is_dead = True
             agent.respawn_timer = 5
             agent.hp = 0
-            # Сброс лута на текущую клетку
             cell = self.game_map.get_cell(agent.x, agent.y)
-            if cell:
-                agent.balance["energy"] = max(0, agent.balance["energy"])
+            if cell and drop_loot_on_starve:
+                # Только бот бросает лут — это честно (он не управляет своим лутом)
+                agent.balance["energy"] = 0
                 for res in ["matter", "energy", "imagination"]:
                     cell.loot[res] = cell.loot.get(res, 0) + agent.balance[res]
-                    agent.balance[res] = 0
+            for res in ["matter", "energy", "imagination"]:
+                agent.balance[res] = 0
 
     # ----------------------------------------------------------
     # Respawn

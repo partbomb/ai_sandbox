@@ -120,24 +120,25 @@ def train(algo_name: str = "PPO", total_steps: int = 500_000,
         model = PPO(
             "MlpPolicy",               # Полносвязная нейросеть
             env,
+            policy_kwargs=dict(net_arch=[256, 256]),  # Увеличенная сеть (было [64, 64])
             learning_rate=3e-4,         # Скорость обучения
             n_steps=2048,               # Шагов перед обновлением
-            batch_size=64,              # Размер батча
+            batch_size=128,             # Увеличенный батч (было 64)
             n_epochs=10,                # Эпох оптимизации
             gamma=0.99,                 # Дисконт будущих наград
             gae_lambda=0.95,            # GAE lambda
             clip_range=0.2,             # Диапазон клиппинга PPO
-            ent_coef=0.01,              # Коэффициент энтропии (исследование)
+            ent_coef=0.02,              # Больше исследования (было 0.01)
             verbose=1,
             tensorboard_log=log_dir,
             device="cpu",              # CPU быстрее для MlpPolicy
         )
         print("\n  Архитектура PPO:")
-        print(f"    Policy:        MlpPolicy (2 слоя по 64 нейрона)")
+        print(f"    Policy:        MlpPolicy (2 слоя по 256 нейронов)")
         print(f"    Learning Rate: 3e-4")
-        print(f"    Batch Size:    64")
+        print(f"    Batch Size:    128")
         print(f"    Gamma:         0.99 (дисконт)")
-        print(f"    Entropy Coef:  0.01 (баланс исследования)\n")
+        print(f"    Entropy Coef:  0.02 (баланс исследования)\n")
 
     elif algo_name.upper() == "DQN":
         model = DQN(
