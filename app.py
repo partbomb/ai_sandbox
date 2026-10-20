@@ -173,6 +173,21 @@ def api_start():
         pos = world.Position(x=random.randint(0, 9), y=random.randint(0, 9))
         agent_obj = world.Stage2AI(agent_data["name"], agent_data["api_key"], agent_data["model"], pos, agent_data.get("income", {}))
         web_state.agents.append(agent_obj)
+
+    # Режим LLM vs RL: спавн обученного RL-агента (PPO) вместе с LLM-агентами
+    if mode == "llm_vs_rl":
+        rl_pos = world.Position(x=random.randint(0, 9), y=random.randint(0, 9))
+        rl_agent = world.Stage2AI(
+            name="RL-PPO-Bot",
+            api_key="",
+            model="PPO-RL-Agent",
+            start_pos=rl_pos,
+            init_income={"matter": 10, "energy": 10, "imagination": 10},
+            is_rl=True,
+            rl_model_path="rl_models/best/best_model"
+        )
+        web_state.agents.append(rl_agent)
+        web_state.add_log("INFO", "🤖 RL-PPO-Bot успешно добавлен на арену (PPO Policy Network)")
     
     web_state.tick = 0
     web_state.logs = []
@@ -215,7 +230,7 @@ def get_state():
             })
         grid_data.append(row)
         
-    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0), "unlocked_techs": getattr(a, 'unlocked_techs', []), "short_term_memory": getattr(a, 'short_term_memory', []), "long_term_memory": getattr(a, 'long_term_memory', '')} for a in web_state.agents]
+    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0), "unlocked_techs": getattr(a, 'unlocked_techs', []), "short_term_memory": getattr(a, 'short_term_memory', []), "long_term_memory": getattr(a, 'long_term_memory', ''), "is_rl": getattr(a, 'is_rl', False)} for a in web_state.agents]
     
     return jsonify({
         "started": True,
@@ -343,6 +358,7 @@ HTML_TEMPLATE = """
         <div style="display: flex; gap: 16px; align-items: center;">
             <div id="tickCounter" style="font-weight: 600; color: #f59e0b; display: none;">⏱️ ТИК: 0</div>
             <button class="start-btn" onclick="startSim('ai_only')" id="startBtnAI">ЗАПУСК (ТОЛЬКО ИИ)</button>
+            <button class="start-btn" style="background: linear-gradient(135deg, #8b5cf6, #7c3aed);" onclick="startSim('llm_vs_rl')" id="startBtnRL">ЗАПУСК (LLM vs RL)</button>
             <button class="start-btn" style="background: linear-gradient(135deg, #10b981, #059669);" onclick="startSim('with_human')" id="startBtnHuman">ЗАПУСК (С ЧЕЛОВЕКОМ)</button>
         </div>
     </header>
@@ -399,6 +415,7 @@ HTML_TEMPLATE = """
                 if(data.started) {
                     isStarted = true;
                     document.getElementById('startBtnAI').style.display = 'none';
+                    if (document.getElementById('startBtnRL')) document.getElementById('startBtnRL').style.display = 'none';
                     document.getElementById('startBtnHuman').style.display = 'none';
                     document.getElementById('tickCounter').style.display = 'block';
                     document.getElementById('mainLayout').style.display = 'flex';
@@ -410,6 +427,7 @@ HTML_TEMPLATE = """
 
         async function startSim(mode) {
             document.getElementById('startBtnAI').style.display = 'none';
+            if (document.getElementById('startBtnRL')) document.getElementById('startBtnRL').style.display = 'none';
             document.getElementById('startBtnHuman').style.display = 'none';
             await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: mode}) });
             isStarted = true;
@@ -478,6 +496,7 @@ HTML_TEMPLATE = """
         const agentColorMap = {};
         let colorCounter = 0;
         function stringToColor(str) {
+            if (str === "RL-PPO-Bot") return "#a855f7";
             if (!agentColorMap[str]) {
                 agentColorMap[str] = distinctColors[colorCounter % distinctColors.length];
                 colorCounter++;
@@ -488,11 +507,13 @@ HTML_TEMPLATE = """
         function renderAgents(agents) {
             const sidebar = document.getElementById('sidebar');
             sidebar.innerHTML = agents.map(a => {
-                const color = a.is_dead ? '#475569' : stringToColor(a.name);
-                const title = a.is_dead ? `💀 ${a.name} (МЕРТВ, ${a.respawn_timer}с)` : `🤖 ${a.name} (HP: ${a.hp})`;
+                const color = a.is_dead ? '#475569' : (a.is_rl ? '#a855f7' : stringToColor(a.name));
+                const rlBadge = a.is_rl ? ' <span style="background: linear-gradient(135deg, #8b5cf6, #6d28d9); font-size: 10px; padding: 2px 6px; border-radius: 4px; color: #fff; font-weight: 700; margin-left: 6px;">PPO RL</span>' : '';
+                const title = a.is_dead ? `💀 ${a.name} (МЕРТВ, ${a.respawn_timer}с)${rlBadge}` : `🤖 ${a.name} (HP: ${a.hp})${rlBadge}`;
 
                 // Strategic Compass (long-term memory)
                 const compassText = (a.long_term_memory && a.long_term_memory.trim()) ? a.long_term_memory : 'Нет данных.';
+                const compassHeader = a.is_rl ? '🧭 СТРАТЕГИЧЕСКИЙ КОМПАС (RL POLICY NETWORK)' : '🧭 СТРАТЕГИЧЕСКИЙ КОМПАС';
 
                 // Mission Log (short-term memory, max 4 entries)
                 const stmLines = (a.short_term_memory && a.short_term_memory.length > 0)
@@ -507,17 +528,20 @@ HTML_TEMPLATE = """
                     : '<span style="font-size: 10px; color: var(--text-muted);">Нет изученных технологий</span>';
 
                 const displayStyle = expandedCards[a.name] ? 'block' : 'none';
+                const cardStyle = a.is_rl
+                    ? `border-left: 4px solid #a855f7; box-shadow: 0 0 15px rgba(168, 85, 247, 0.15); opacity: ${a.is_dead ? 0.6 : 1};`
+                    : `border-left: 4px solid ${color}; opacity: ${a.is_dead ? 0.6 : 1};`;
 
                 return `
-                <div class="agent-card" style="border-left: 4px solid ${color}; opacity: ${a.is_dead ? 0.6 : 1};">
+                <div class="agent-card" style="${cardStyle}">
                     <h3 style="color: ${color}">${title}</h3>
                     <div style="font-size: 14px;">Координаты: X:${a.x}, Y:${a.y}</div>
                     <div style="font-size: 12px; margin-top: 6px;">Ресурсы (до 5000):</div>
                     <div style="font-size: 11px;">M: ${a.balance.matter} | E: ${a.balance.energy} | I: ${a.balance.imagination}</div>
                     <div style="font-size: 14px; margin-top: 6px;">Счет (Клетки): <b>${a.score}</b></div>
 
-                    <div style="margin-top: 10px; background: rgba(6,182,212,0.07); border: 1px solid rgba(6,182,212,0.25); border-radius: 8px; padding: 8px;">
-                        <div style="font-size: 10px; color: #06b6d4; font-weight: 700; margin-bottom: 4px;">🧭 СТРАТЕГИЧЕСКИЙ КОМПАС</div>
+                    <div style="margin-top: 10px; background: ${a.is_rl ? 'rgba(168,85,247,0.1)' : 'rgba(6,182,212,0.07)'}; border: 1px solid ${a.is_rl ? 'rgba(168,85,247,0.3)' : 'rgba(6,182,212,0.25)'}; border-radius: 8px; padding: 8px;">
+                        <div style="font-size: 10px; color: ${a.is_rl ? '#c084fc' : '#06b6d4'}; font-weight: 700; margin-bottom: 4px;">${compassHeader}</div>
                         <div style="font-size: 11px; color: #e2e8f0; font-style: italic; line-height: 1.4;">"${compassText}"</div>
                     </div>
 
@@ -570,8 +594,10 @@ HTML_TEMPLATE = """
 
                     let avatarHtml = '';
                     if (cell.avatar) {
-                        const avatarColor = stringToColor(cell.avatar);
-                        avatarHtml = `<div class="avatar-badge" style="background: ${avatarColor};">🤖</div>`;
+                        const isRL = (cell.avatar === "RL-PPO-Bot");
+                        const avatarColor = isRL ? "#a855f7" : stringToColor(cell.avatar);
+                        const avatarEmoji = isRL ? "⚡" : "🤖";
+                        avatarHtml = `<div class="avatar-badge" style="background: ${avatarColor}; box-shadow: ${isRL ? '0 0 10px #a855f7' : '0 0 10px rgba(0,0,0,0.5)'};">${avatarEmoji}</div>`;
                     }
                     
                     html += `<div class="cell ${extraClass}" style="${cellStyle}">${content}${avatarHtml}${jackpotHtml}</div>`;

@@ -1,8 +1,10 @@
 import json
 import logging
+import os
 import random
 import asyncio
 from typing import List, Optional
+import numpy as np
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
@@ -22,6 +24,30 @@ TECH_TREE = {
     "logistics_lvl_2": {"cost": 500, "parent": "logistics_lvl_1"},
     "logistics_lvl_3": {"cost": 1500, "parent": "logistics_lvl_2"}
 }
+
+# --- RL Константы (совместимые с rl_env.py) ---
+RL_MAP_SIZE = 7
+RL_MAX_RESOURCE = 5000
+RL_TECH_NAMES = [
+    "combat_lvl_1", "combat_lvl_2", "combat_lvl_3",
+    "economy_lvl_1", "economy_lvl_2", "economy_lvl_3",
+    "logistics_lvl_1", "logistics_lvl_2", "logistics_lvl_3",
+]
+RL_ACTION_NAMES = [
+    "MOVE_TO_MINE", "MOVE_TO_ENEMY", "MOVE_TO_ENERGY_MINE",
+    "CAPTURE", "ATTACK", "BUILD", "RESEARCH",
+    "GATHER_LOOT", "PASS"
+]
+RL_ADJACENT_OFFSETS = [
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1),           (0, 1),
+    (1, -1),  (1, 0),  (1, 1),
+]
+RL_SELF_AND_ADJACENT = [
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1),  (0, 0),  (0, 1),
+    (1, -1),  (1, 0),  (1, 1),
+]
 
 # --- Базовые структуры карты ---
 
@@ -134,7 +160,17 @@ class MapCore:
 # --- Расширение для Агента (Единственный Аватар) ---
 
 class Stage2AI: 
-    def __init__(self, name: str, api_key: str, model: str, start_pos: Position, init_income: dict, is_human: bool = False):
+    def __init__(
+        self,
+        name: str,
+        api_key: str,
+        model: str,
+        start_pos: Position,
+        init_income: dict,
+        is_human: bool = False,
+        is_rl: bool = False,
+        rl_model_path: str = "rl_models/best/best_model"
+    ):
         self.name = name
         self.api_key = api_key
         self.model = model
@@ -153,14 +189,54 @@ class Stage2AI:
         # Short-term: rolling log of last 4 actions ("Бортовой журнал")
         self.short_term_memory: list[str] = []
         # Long-term: strategic compass, agent rewrites each turn ("Стратегический компас")
-        self.long_term_memory: str = "Начало. Изучить карту и захватить ближайшую шахту."
+        self.long_term_memory: str = (
+            "Максимизация функции полезности V(s)" if is_rl
+            else "Начало. Изучить карту и захватить ближайшую шахту."
+        )
 
         self.is_human = is_human
         self.human_action = None
         self.human_prompt = ""
         self.human_ready = asyncio.Event()
 
-        self.client = genai.Client(api_key=self.api_key) if self.api_key and not self.api_key.startswith("sk-") and "test" not in self.api_key.lower() and not self.is_human else None
+        # --- RL Mode Settings ---
+        self.is_rl = is_rl
+        self.rl_model_path = rl_model_path
+        self.rl_model = None
+
+        if self.is_rl:
+            self.client = None
+            self._load_rl_model(rl_model_path)
+        elif self.api_key and not self.api_key.startswith("sk-") and "test" not in self.api_key.lower() and not self.is_human:
+            self.client = genai.Client(api_key=self.api_key)
+        else:
+            self.client = None
+
+    def _load_rl_model(self, rl_model_path: str):
+        """Загружает обученную RL модель (PPO / DQN) с фоллбэком на эвристику."""
+        try:
+            from stable_baselines3 import PPO, DQN
+        except ImportError:
+            logger.warning(f"[{self.name}] stable_baselines3 не установлена в текущем окружении. Включен эвристический фоллбэк.")
+            self.rl_model = None
+            return
+
+        model_file = rl_model_path if rl_model_path.endswith(".zip") else rl_model_path + ".zip"
+        if not os.path.exists(model_file) and not os.path.exists(rl_model_path):
+            logger.warning(f"[{self.name}] Файл RL модели '{rl_model_path}' не найден. Сервер продолжает работу в режиме эвристики.")
+            self.rl_model = None
+            return
+
+        try:
+            self.rl_model = PPO.load(rl_model_path, device='cpu')
+            logger.info(f"[{self.name}] ✅ Успешно загружена RL-модель PPO из '{rl_model_path}'")
+        except Exception as e_ppo:
+            try:
+                self.rl_model = DQN.load(rl_model_path, device='cpu')
+                logger.info(f"[{self.name}] ✅ Успешно загружена RL-модель DQN из '{rl_model_path}'")
+            except Exception as e_dqn:
+                logger.warning(f"[{self.name}] ⚠️ Не удалось загрузить модель (PPO: {e_ppo}, DQN: {e_dqn}). Включен эвристический фоллбэк.")
+                self.rl_model = None
 
     def generate_prompt(self, map_core: MapCore) -> str:
         surroundings = map_core.get_map_state_json()
@@ -232,7 +308,511 @@ class Stage2AI:
         )
         return prompt
 
-    async def get_action_from_llm(self, map_core: MapCore) -> dict:
+    def _build_rl_obs(self, map_core: MapCore, all_agents: Optional[List['Stage2AI']] = None, target_dim: int = 315) -> np.ndarray:
+        """
+        Переводит текущее состояние MapCore в вектор признаков (float32).
+        Для карт 10x10 вырезает окно 7x7 с центром вокруг агента.
+        По умолчанию возвращает вектор из 315 элементов:
+          294 (карта 7x7x6) + 6 (игрок) + 6 (враг) + 9 (технологии) = 315.
+        При target_dim=324 дополняет 9 подсказками из AISandboxEnv (rl_env.py).
+        """
+        if all_agents is None:
+            all_agents = [self]
+
+        obs = []
+
+        # 1. Окно 7x7 вокруг агента
+        if map_core.width >= RL_MAP_SIZE:
+            start_x = max(0, min(self.position.x - 3, map_core.width - RL_MAP_SIZE))
+        else:
+            start_x = 0
+
+        if map_core.height >= RL_MAP_SIZE:
+            start_y = max(0, min(self.position.y - 3, map_core.height - RL_MAP_SIZE))
+        else:
+            start_y = 0
+
+        # 2. Каналы карты (7x7 x 6 = 294)
+        for wy in range(RL_MAP_SIZE):
+            for wx in range(RL_MAP_SIZE):
+                mx = start_x + wx
+                my = start_y + wy
+                cell = map_core.get_cell(mx, my)
+
+                # Канал 1: Владелец (0 = нет, 0.5 = self, 1.0 = враг)
+                owner_val = 0.0
+                if cell and cell.owner_id:
+                    if cell.owner_id == self.name:
+                        owner_val = 0.5
+                    else:
+                        owner_val = 1.0
+                obs.append(owner_val)
+
+                # Канал 2: Наличие шахты (1.0 если ресурс есть)
+                has_res = 1.0 if (cell and cell.resource_type) else 0.0
+                obs.append(has_res)
+
+                # Канал 3: Тип ресурса (0 = нет, 0.33 = Matter, 0.66 = Energy, 1.0 = Imagination)
+                rt = 0.0
+                if cell and cell.resource_type:
+                    res_lower = cell.resource_type.lower()
+                    if res_lower == "matter":
+                        rt = 0.33
+                    elif res_lower == "energy":
+                        rt = 0.66
+                    elif res_lower == "imagination":
+                        rt = 1.0
+                obs.append(rt)
+
+                # Канал 4: Уровень шахты (0-3 -> 0.0-1.0)
+                obs.append(min((cell.mine_level if cell else 0) / 3.0, 1.0))
+
+                # Канал 5: Структура (1.0 если стена)
+                is_wall = 1.0 if (cell and cell.structure and cell.structure.lower() == 'wall') else 0.0
+                obs.append(is_wall)
+
+                # Канал 6: Наличие лута
+                has_loot = 1.0 if (cell and cell.loot and any(v > 0 for v in cell.loot.values())) else 0.0
+                obs.append(has_loot)
+
+        # 3. Состояние агента (self) - 6 значений
+        rel_x = max(0, min(self.position.x - start_x, RL_MAP_SIZE - 1))
+        rel_y = max(0, min(self.position.y - start_y, RL_MAP_SIZE - 1))
+        obs.append(rel_x / (RL_MAP_SIZE - 1))
+        obs.append(rel_y / (RL_MAP_SIZE - 1))
+        obs.append(getattr(self, 'hp', 100) / 100.0)
+        obs.append(min(self.balance.get("matter", 0) / RL_MAX_RESOURCE, 1.0))
+        obs.append(min(self.balance.get("energy", 0) / RL_MAX_RESOURCE, 1.0))
+        obs.append(min(self.balance.get("imagination", 0) / RL_MAX_RESOURCE, 1.0))
+
+        # 4. Состояние ближайшего врага - 6 значений
+        enemy = None
+        min_dist = float('inf')
+        for a in all_agents:
+            if a.name != self.name and not a.is_dead:
+                d = abs(a.position.x - self.position.x) + abs(a.position.y - self.position.y)
+                if d < min_dist:
+                    min_dist = d
+                    enemy = a
+        if enemy is None:
+            for a in all_agents:
+                if a.name != self.name:
+                    d = abs(a.position.x - self.position.x) + abs(a.position.y - self.position.y)
+                    if d < min_dist:
+                        min_dist = d
+                        enemy = a
+
+        if enemy is not None:
+            e_rel_x = max(0, min(enemy.position.x - start_x, RL_MAP_SIZE - 1))
+            e_rel_y = max(0, min(enemy.position.y - start_y, RL_MAP_SIZE - 1))
+            obs.append(e_rel_x / (RL_MAP_SIZE - 1))
+            obs.append(e_rel_y / (RL_MAP_SIZE - 1))
+            obs.append(getattr(enemy, 'hp', 100) / 100.0 if not enemy.is_dead else 0.0)
+            obs.append(min(enemy.balance.get("matter", 0) / RL_MAX_RESOURCE, 1.0))
+            obs.append(min(enemy.balance.get("energy", 0) / RL_MAX_RESOURCE, 1.0))
+            obs.append(min(enemy.balance.get("imagination", 0) / RL_MAX_RESOURCE, 1.0))
+        else:
+            obs.extend([0.5, 0.5, 0.0, 0.0, 0.0, 0.0])
+
+        # 5. Дерево технологий - 9 бинарных значений
+        for tech in RL_TECH_NAMES:
+            obs.append(1.0 if tech in self.unlocked_techs else 0.0)
+
+        # 6. Расширенные подсказки (если запрошено >= 324 элементов)
+        if target_dim > 315:
+            # dx/dy к ближайшей шахте
+            best_m = None
+            best_m_dist = float('inf')
+            for row in map_core.grid:
+                for c in row:
+                    if c.resource_type and c.owner_id != self.name:
+                        d = abs(c.pos.x - self.position.x) + abs(c.pos.y - self.position.y)
+                        if d < best_m_dist:
+                            best_m_dist = d
+                            best_m = c
+            if best_m:
+                obs.append((best_m.pos.x - self.position.x + RL_MAP_SIZE) / (2 * RL_MAP_SIZE))
+                obs.append((best_m.pos.y - self.position.y + RL_MAP_SIZE) / (2 * RL_MAP_SIZE))
+            else:
+                obs.extend([0.5, 0.5])
+
+            # dx/dy к ближайшей энергетической шахте
+            best_em = None
+            best_em_dist = float('inf')
+            for row in map_core.grid:
+                for c in row:
+                    if c.resource_type and c.resource_type.lower() == 'energy' and c.owner_id != self.name:
+                        d = abs(c.pos.x - self.position.x) + abs(c.pos.y - self.position.y)
+                        if d < best_em_dist:
+                            best_em_dist = d
+                            best_em = c
+            if best_em:
+                obs.append((best_em.pos.x - self.position.x + RL_MAP_SIZE) / (2 * RL_MAP_SIZE))
+                obs.append((best_em.pos.y - self.position.y + RL_MAP_SIZE) / (2 * RL_MAP_SIZE))
+            else:
+                obs.extend([0.5, 0.5])
+
+            # dx/dy к врагу
+            if enemy and not enemy.is_dead:
+                obs.append((enemy.position.x - self.position.x + RL_MAP_SIZE) / (2 * RL_MAP_SIZE))
+                obs.append((enemy.position.y - self.position.y + RL_MAP_SIZE) / (2 * RL_MAP_SIZE))
+            else:
+                obs.extend([0.5, 0.5])
+
+            # can_capture
+            can_capture = 0.0
+            for odx, ody in RL_SELF_AND_ADJACENT:
+                c = map_core.get_cell(self.position.x + odx, self.position.y + ody)
+                if c and c.resource_type and c.owner_id != self.name and c.structure != 'Wall':
+                    can_capture = 1.0
+                    break
+            obs.append(can_capture)
+
+            # can_attack
+            can_attack = 0.0
+            if enemy and not enemy.is_dead:
+                d = abs(enemy.position.x - self.position.x) + abs(enemy.position.y - self.position.y)
+                if d <= 1:
+                    can_attack = 1.0
+            obs.append(can_attack)
+
+            # has_loot_nearby
+            has_loot_nearby = 0.0
+            for odx, ody in RL_SELF_AND_ADJACENT:
+                c = map_core.get_cell(self.position.x + odx, self.position.y + ody)
+                if c and c.loot and any(v > 0 for v in c.loot.values()):
+                    has_loot_nearby = 1.0
+                    break
+            obs.append(has_loot_nearby)
+
+        # Приведение к целевой длине target_dim
+        if len(obs) < target_dim:
+            obs.extend([0.0] * (target_dim - len(obs)))
+        elif len(obs) > target_dim:
+            obs = obs[:target_dim]
+
+        obs = np.clip(obs, 0.0, 1.0)
+        return np.array(obs, dtype=np.float32)
+
+    def _get_move_direction(self, tx: int, ty: int, map_core: MapCore, all_agents: List['Stage2AI']) -> Optional[str]:
+        """Определяет наилучшее направление шага (N, S, E, W) к цели с обходом стен и агентов."""
+        dx = 1 if tx > self.position.x else (-1 if tx < self.position.x else 0)
+        dy = 1 if ty > self.position.y else (-1 if ty < self.position.y else 0)
+
+        if dx == 0 and dy == 0:
+            return None
+
+        candidates = []
+        if dx != 0:
+            candidates.append((self.position.x + dx, self.position.y, 'E' if dx > 0 else 'W'))
+        if dy != 0:
+            candidates.append((self.position.x, self.position.y + dy, 'S' if dy > 0 else 'N'))
+
+        # Перпендикулярные кандидаты для обхода препятствий (v2 logic)
+        if dx == 0:
+            candidates.append((self.position.x + 1, self.position.y, 'E'))
+            candidates.append((self.position.x - 1, self.position.y, 'W'))
+        if dy == 0:
+            candidates.append((self.position.x, self.position.y + 1, 'S'))
+            candidates.append((self.position.x, self.position.y - 1, 'N'))
+
+        for nx, ny, direction in candidates:
+            if 0 <= nx < map_core.width and 0 <= ny < map_core.height:
+                cell = map_core.get_cell(nx, ny)
+                if cell and cell.structure != 'Wall':
+                    occupied = any(
+                        a.position.x == nx and a.position.y == ny and a.name != self.name and not a.is_dead
+                        for a in all_agents
+                    )
+                    if not occupied:
+                        return direction
+        return None
+
+    def _heuristic_policy(self, map_core: MapCore, all_agents: List['Stage2AI']) -> int:
+        """Эвристическая политика при отсутствии весов модели (безопасный фоллбэк)."""
+        # 1. Если энергии мало (< 15) и рядом энергошахта -> захватить или идти к ней
+        if self.balance.get("energy", 0) < 15:
+            for odx, ody in RL_SELF_AND_ADJACENT:
+                c = map_core.get_cell(self.position.x + odx, self.position.y + ody)
+                if c and c.resource_type and c.resource_type.lower() == 'energy' and c.owner_id != self.name and c.structure != 'Wall':
+                    if self.balance.get("imagination", 0) >= 10:
+                        return 3  # CAPTURE
+            return 2  # MOVE_TO_ENERGY_MINE
+
+        # 2. Захват шахты в радиусе досягаемости
+        if self.balance.get("imagination", 0) >= 10:
+            for odx, ody in RL_SELF_AND_ADJACENT:
+                c = map_core.get_cell(self.position.x + odx, self.position.y + ody)
+                if c and c.resource_type and c.owner_id != self.name and c.structure != 'Wall':
+                    return 3  # CAPTURE
+
+        # 3. Атака ближайшего врага
+        if self.balance.get("energy", 0) >= 5:
+            for a in all_agents:
+                if a.name != self.name and not a.is_dead:
+                    if abs(a.position.x - self.position.x) <= 1 and abs(a.position.y - self.position.y) <= 1:
+                        return 4  # ATTACK
+
+        # 4. Изучение технологий
+        priority_techs = [
+            "economy_lvl_1", "combat_lvl_1", "logistics_lvl_1",
+            "economy_lvl_2", "combat_lvl_2", "logistics_lvl_2",
+            "economy_lvl_3", "combat_lvl_3", "logistics_lvl_3",
+        ]
+        for tech in priority_techs:
+            if tech not in self.unlocked_techs:
+                parent = TECH_TREE[tech]["parent"]
+                if parent is None or parent in self.unlocked_techs:
+                    if self.balance.get("imagination", 0) >= TECH_TREE[tech]["cost"]:
+                        return 6  # RESEARCH
+                    break
+
+        # 5. Сбор лута
+        has_any_loot = any(any(v > 0 for v in c.loot.values()) for row in map_core.grid for c in row)
+        if has_any_loot and self.balance.get("energy", 0) >= 5:
+            return 7  # GATHER_LOOT
+
+        # 6. Движение к ничейной шахте
+        unowned_mine = any(c.resource_type and c.owner_id != self.name for row in map_core.grid for c in row)
+        if unowned_mine and self.balance.get("energy", 0) >= 5:
+            return 0  # MOVE_TO_MINE
+
+        return 8  # PASS
+
+    def _convert_rl_action_to_json(self, action_idx: int, map_core: MapCore, all_agents: List['Stage2AI']) -> dict:
+        """Переводит индекс действия RL (0..8) в JSON-формат для ArbitorPhysical.execute_action()."""
+        action_name = RL_ACTION_NAMES[action_idx] if 0 <= action_idx < len(RL_ACTION_NAMES) else f"ACTION_{action_idx}"
+        thought_str = f"RL Policy Network decision: {action_name}"
+        compass_str = "Максимизация функции полезности V(s)"
+
+        # 0: MOVE_TO_MINE
+        if action_idx == 0:
+            best_target = None
+            best_dist = float('inf')
+            for row in map_core.grid:
+                for cell in row:
+                    if cell.resource_type and cell.owner_id != self.name:
+                        d = abs(cell.pos.x - self.position.x) + abs(cell.pos.y - self.position.y)
+                        if d < best_dist:
+                            best_dist = d
+                            best_target = cell
+            if best_target:
+                d = self._get_move_direction(best_target.pos.x, best_target.pos.y, map_core, all_agents)
+                if d:
+                    return {
+                        "action": "MOVE",
+                        "params": {"direction": d},
+                        "thought": f"{thought_str} -> к шахте ({best_target.pos.x}, {best_target.pos.y})",
+                        "new_compass": compass_str
+                    }
+            return {"action": "PASS", "params": {}, "thought": f"{thought_str} (шахт нет или заблокировано)", "new_compass": compass_str}
+
+        # 1: MOVE_TO_ENEMY
+        elif action_idx == 1:
+            enemy = None
+            min_dist = float('inf')
+            for a in all_agents:
+                if a.name != self.name and not a.is_dead:
+                    d = abs(a.position.x - self.position.x) + abs(a.position.y - self.position.y)
+                    if d < min_dist:
+                        min_dist = d
+                        enemy = a
+            if enemy:
+                d = self._get_move_direction(enemy.position.x, enemy.position.y, map_core, all_agents)
+                if d:
+                    return {
+                        "action": "MOVE",
+                        "params": {"direction": d},
+                        "thought": f"{thought_str} -> сближение с врагом {enemy.name}",
+                        "new_compass": compass_str
+                    }
+            return {"action": "PASS", "params": {}, "thought": f"{thought_str} (врагов нет или заблокировано)", "new_compass": compass_str}
+
+        # 2: MOVE_TO_ENERGY_MINE
+        elif action_idx == 2:
+            best_target = None
+            best_dist = float('inf')
+            for row in map_core.grid:
+                for cell in row:
+                    if cell.resource_type and cell.resource_type.lower() == 'energy' and cell.owner_id != self.name:
+                        d = abs(cell.pos.x - self.position.x) + abs(cell.pos.y - self.position.y)
+                        if d < best_dist:
+                            best_dist = d
+                            best_target = cell
+            if best_target:
+                d = self._get_move_direction(best_target.pos.x, best_target.pos.y, map_core, all_agents)
+                if d:
+                    return {
+                        "action": "MOVE",
+                        "params": {"direction": d},
+                        "thought": f"{thought_str} -> к энергошахте ({best_target.pos.x}, {best_target.pos.y})",
+                        "new_compass": compass_str
+                    }
+            return {"action": "PASS", "params": {}, "thought": f"{thought_str} (энергошахта недоступна)", "new_compass": compass_str}
+
+        # 3: CAPTURE
+        elif action_idx == 3:
+            best_cell = None
+            for odx, ody in RL_SELF_AND_ADJACENT:
+                c = map_core.get_cell(self.position.x + odx, self.position.y + ody)
+                if c and c.resource_type and c.owner_id != self.name and c.structure != 'Wall':
+                    enemy_on_cell = any(a.position.x == c.pos.x and a.position.y == c.pos.y and a.name != self.name and not a.is_dead for a in all_agents)
+                    if not enemy_on_cell:
+                        if best_cell is None:
+                            best_cell = c
+                        if c.resource_type.lower() == 'energy':
+                            best_cell = c
+                            break
+            if best_cell:
+                return {
+                    "action": "CAPTURE",
+                    "params": {"target_x": best_cell.pos.x, "target_y": best_cell.pos.y},
+                    "thought": f"{thought_str} -> захват шахты ({best_cell.pos.x}, {best_cell.pos.y})",
+                    "new_compass": compass_str
+                }
+            # Если рядом нет шахты, подходим к ближайшей
+            best_m = None
+            best_d = float('inf')
+            for row in map_core.grid:
+                for cell in row:
+                    if cell.resource_type and cell.owner_id != self.name:
+                        d = abs(cell.pos.x - self.position.x) + abs(cell.pos.y - self.position.y)
+                        if d < best_d:
+                            best_d = d
+                            best_m = cell
+            if best_m:
+                d = self._get_move_direction(best_m.pos.x, best_m.pos.y, map_core, all_agents)
+                if d:
+                    return {"action": "MOVE", "params": {"direction": d}, "thought": f"{thought_str} -> подход к шахте ({best_m.pos.x}, {best_m.pos.y})", "new_compass": compass_str}
+            return {"action": "PASS", "params": {}, "thought": f"{thought_str} (нет цели для захвата)", "new_compass": compass_str}
+
+        # 4: ATTACK
+        elif action_idx == 4:
+            # Приоритет 1: враг рядом
+            for a in all_agents:
+                if a.name != self.name and not a.is_dead:
+                    if abs(a.position.x - self.position.x) <= 1 and abs(a.position.y - self.position.y) <= 1:
+                        return {
+                            "action": "ATTACK",
+                            "params": {"target_x": a.position.x, "target_y": a.position.y},
+                            "thought": f"{thought_str} -> атака врага {a.name}",
+                            "new_compass": compass_str
+                        }
+            # Приоритет 2: стена или вражеская шахта рядом
+            for odx, ody in RL_ADJACENT_OFFSETS:
+                c = map_core.get_cell(self.position.x + odx, self.position.y + ody)
+                if c:
+                    if c.structure == 'Wall':
+                        return {
+                            "action": "ATTACK",
+                            "params": {"target_x": c.pos.x, "target_y": c.pos.y},
+                            "thought": f"{thought_str} -> атака стены ({c.pos.x}, {c.pos.y})",
+                            "new_compass": compass_str
+                        }
+                    elif c.resource_type and c.owner_id not in (self.name, None):
+                        return {
+                            "action": "ATTACK",
+                            "params": {"target_x": c.pos.x, "target_y": c.pos.y},
+                            "thought": f"{thought_str} -> атака вражеской шахты ({c.pos.x}, {c.pos.y})",
+                            "new_compass": compass_str
+                        }
+            return {"action": "PASS", "params": {}, "thought": f"{thought_str} (нет целей для атаки)", "new_compass": compass_str}
+
+        # 5: BUILD
+        elif action_idx == 5:
+            for odx, ody in RL_ADJACENT_OFFSETS:
+                c = map_core.get_cell(self.position.x + odx, self.position.y + ody)
+                if c and c.structure is None and c.resource_type is None:
+                    occupied = any(a.position.x == c.pos.x and a.position.y == c.pos.y and not a.is_dead for a in all_agents)
+                    if not occupied:
+                        return {
+                            "action": "BUILD",
+                            "params": {"target_x": c.pos.x, "target_y": c.pos.y},
+                            "thought": f"{thought_str} -> постройка стены на ({c.pos.x}, {c.pos.y})",
+                            "new_compass": compass_str
+                        }
+            return {"action": "PASS", "params": {}, "thought": f"{thought_str} (нет места для постройки)", "new_compass": compass_str}
+
+        # 6: RESEARCH
+        elif action_idx == 6:
+            priority_techs = [
+                "economy_lvl_1", "combat_lvl_1", "logistics_lvl_1",
+                "economy_lvl_2", "combat_lvl_2", "logistics_lvl_2",
+                "economy_lvl_3", "combat_lvl_3", "logistics_lvl_3",
+            ]
+            for tech in priority_techs:
+                if tech not in self.unlocked_techs:
+                    parent = TECH_TREE[tech]["parent"]
+                    if parent is None or parent in self.unlocked_techs:
+                        if self.balance.get("imagination", 0) >= TECH_TREE[tech]["cost"]:
+                            return {
+                                "action": "RESEARCH",
+                                "params": {"tech": tech},
+                                "thought": f"{thought_str} -> исследование {tech}",
+                                "new_compass": compass_str
+                            }
+            return {"action": "PASS", "params": {}, "thought": f"{thought_str} (не хватает ресурсов на технологию)", "new_compass": compass_str}
+
+        # 7: GATHER_LOOT
+        elif action_idx == 7:
+            best_loot = None
+            best_dist = float('inf')
+            for row in map_core.grid:
+                for cell in row:
+                    if cell.loot and any(v > 0 for v in cell.loot.values()):
+                        d = abs(cell.pos.x - self.position.x) + abs(cell.pos.y - self.position.y)
+                        if d < best_dist:
+                            best_dist = d
+                            best_loot = cell
+            if best_loot:
+                d = self._get_move_direction(best_loot.pos.x, best_loot.pos.y, map_core, all_agents)
+                if d:
+                    return {
+                        "action": "MOVE",
+                        "params": {"direction": d},
+                        "thought": f"{thought_str} -> к луту ({best_loot.pos.x}, {best_loot.pos.y})",
+                        "new_compass": compass_str
+                    }
+            return {"action": "PASS", "params": {}, "thought": f"{thought_str} (лута нет на карте)", "new_compass": compass_str}
+
+        # 8: PASS
+        return {
+            "action": "PASS",
+            "params": {},
+            "thought": thought_str,
+            "new_compass": compass_str
+        }
+
+    async def get_action_from_rl(self, map_core: MapCore, all_agents: Optional[List['Stage2AI']] = None) -> dict:
+        """Получает действие от обученной RL модели (PPO/DQN) или эвристического фоллбэка."""
+        if all_agents is None:
+            all_agents = [self]
+
+        action_idx = None
+        if self.rl_model is not None:
+            try:
+                # Определение размерности наблюдений, требуемой моделью
+                req_dim = 315
+                if hasattr(self.rl_model, "observation_space") and hasattr(self.rl_model.observation_space, "shape"):
+                    req_dim = self.rl_model.observation_space.shape[0]
+
+                obs = self._build_rl_obs(map_core, all_agents, target_dim=req_dim)
+                action_pred, _ = self.rl_model.predict(obs, deterministic=True)
+                action_idx = int(action_pred)
+            except Exception as e:
+                logger.warning(f"[{self.name}] Ошибка инференса RL модели: {e}. Переход на эвристику.")
+                action_idx = None
+
+        if action_idx is None:
+            action_idx = self._heuristic_policy(map_core, all_agents)
+
+        return self._convert_rl_action_to_json(action_idx, map_core, all_agents)
+
+    async def get_action_from_llm(self, map_core: MapCore, all_agents: Optional[List['Stage2AI']] = None) -> dict:
+        # Если агент является RL-агентом, направляем ход в нейросетевую политику
+        if getattr(self, 'is_rl', False):
+            return await self.get_action_from_rl(map_core, all_agents)
+
         prompt = self.generate_prompt(map_core)
         
         if getattr(self, 'is_human', False):
@@ -277,6 +857,31 @@ class Stage2AI:
             logger.error(f"[{self.name}] LLM Error: {e}")
             await asyncio.sleep(2) 
             return {"action": "PASS"}
+
+
+class RLAgent(Stage2AI):
+    """Специализированный класс RL-агента (PPO/DQN), наследующий Stage2AI."""
+    def __init__(
+        self,
+        name: str = "RL-PPO-Bot",
+        api_key: str = "",
+        model: str = "PPO-Policy",
+        start_pos: Position = Position(x=0, y=0),
+        init_income: dict = None,
+        rl_model_path: str = "rl_models/best/best_model"
+    ):
+        if init_income is None:
+            init_income = {"matter": 10, "energy": 10, "imagination": 10}
+        super().__init__(
+            name=name,
+            api_key=api_key,
+            model=model,
+            start_pos=start_pos,
+            init_income=init_income,
+            is_human=False,
+            is_rl=True,
+            rl_model_path=rl_model_path
+        )
 
 
 # --- Валидатор физических действий ---
@@ -589,8 +1194,8 @@ async def agent_loop(agent: Stage2AI, map_core: MapCore, arbiter: ArbitorPhysica
 
             turn_number += 1
 
-            # Агент думает (ждем ответа LLM)
-            action_data = await agent.get_action_from_llm(map_core)
+            # Агент думает (ждем ответа LLM или инференса RL)
+            action_data = await agent.get_action_from_llm(map_core, all_agents)
 
             # Агент применяет действие к карте
             if agent.is_dead:
