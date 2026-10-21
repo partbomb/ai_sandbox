@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 import random
 import asyncio
 from typing import List, Optional
@@ -75,6 +76,7 @@ class MapCore:
             for x in range(width)
         ]
         self.lock = asyncio.Lock()  # Блокировка для асинхронного доступа к карте
+        self.diplomacy_log: List[dict] = []  # Общий лог дипломатических переговоров
 
     def spawn_mines(self):
         resources = ['Matter', 'Matter', 'Matter', 'Energy', 'Energy', 'Energy', 'Imagination', 'Imagination', 'Imagination']
@@ -199,6 +201,9 @@ class Stage2AI:
         self.human_prompt = ""
         self.human_ready = asyncio.Event()
 
+        # --- Diplomacy & Messaging ---
+        self.inbox: List[str] = []  # Хранит последние 3 входящих дипломатических сообщения
+
         # --- RL Mode Settings ---
         self.is_rl = is_rl
         self.rl_model_path = rl_model_path
@@ -265,12 +270,18 @@ class Stage2AI:
         if "logistics_lvl_3" in self.unlocked_techs:
             actions_str += f"7. JUMP: {{\"action\": \"JUMP\", \"params\": {{\"target_x\": X, \"target_y\": Y}}}}. Cost: 50 Energy. Teleports to any cell.\n"
         actions_str += "8. GAMBLE: {\"action\": \"GAMBLE\", \"params\": {\"target_x\": X, \"target_y\": Y, \"bet\": AMOUNT, \"resource\": \"matter\"/\"energy\"/\"imagination\"}}. MUST be adjacent/on a 🎰 Casino cell. Min bet: 10. 40% chance to WIN 2x, 5% JACKPOT (3x + jackpot pool), 55% LOSE bet.\n"
-        actions_str += "9. PASS: {\"action\": \"PASS\"}\n"
+        actions_str += "9. DIPLOMACY: {\"action\": \"DIPLOMACY\", \"params\": {\"target_agent\": \"Имя_Агента или ALL\", \"message\": \"Текст предложения союза/угрозы/обмана\"}}. Cost: 0 Energy. Free diplomatic communication to negotiate alliances, coordination, threats or bluffing.\n"
+        actions_str += "10. GIVE: {\"action\": \"GIVE\", \"params\": {\"target_x\": X, \"target_y\": Y, \"resource\": \"matter\"/\"energy\"/\"imagination\", \"amount\": 20}}. Transfer resources to an adjacent agent to support an ally.\n"
+        actions_str += "11. PASS: {\"action\": \"PASS\"}\n"
 
         # --- Build memory sections ---
         # Short-term: last 4 actions (бортовой журнал)
         stm_lines = self.short_term_memory if self.short_term_memory else ["Нет записей."]
         stm_text = "\n".join(f"  {i+1}. {line}" for i, line in enumerate(stm_lines))
+
+        # Входящие дипломатические сообщения (последние 3)
+        inbox_msgs = self.inbox if getattr(self, 'inbox', None) else ["(Входящих дипломатических сообщений нет)"]
+        inbox_text = "\n".join(f"  {i+1}. {msg}" for i, msg in enumerate(inbox_msgs))
 
         prompt = (
             f"=== ПАПКА С ДЕЛОМ (твой текущий контекст) ===\n\n"
@@ -282,6 +293,8 @@ class Stage2AI:
             f"  Имя: {self.name} | Позиция: X:{self.position.x}, Y:{self.position.y} | HP: {self.hp}/100\n"
             f"  Баланс: Matter={self.balance['matter']}, Energy={self.balance['energy']}, Imagination={self.balance['imagination']}\n"
             f"  Карта ({map_core.width}x{map_core.height}, X:0-{map_core.width-1}, Y:0-{map_core.height-1}):\n{surroundings}\n\n"
+            f"[4] ВХОДЯЩИЕ СООБЩЕНИЯ (Дипломатия):\n"
+            f"{inbox_text}\n\n"
             f"TECH STATUS:\n{tech_status}\n\n"
             f"WIN CONDITIONS:\n"
             f"  1. Singularity: 5000 of all resources.\n"
@@ -294,6 +307,8 @@ class Stage2AI:
             f"- BUILD: Builds a Wall on an adjacent cell.\n"
             f"- GAMBLE: Go to a 🎰 Casino cell and bet resources for a chance to multiply them! High risk, high reward.\n"
             f"- CAPTURE: Reprograms a mine. Requires cell to be clear of enemies/walls.\n"
+            f"- DIPLOMACY: Send a message to any agent or 'ALL'. Cost: 0 Energy. Allows negotiating non-aggression pacts, alliances, trade or bluffing.\n"
+            f"- GIVE: Transfer specified amount of Matter, Energy, or Imagination to an adjacent agent to support an ally.\n"
             f"MAP BOUNDARIES: DO NOT move outside 0-{max(map_core.width-1, map_core.height-1)}! If at Y=0 cannot move N, Y={map_core.height-1} cannot move S, X=0 cannot move W, X={map_core.width-1} cannot move E.\n\n"
             f"Available actions (return strictly JSON):\n"
             f"{actions_str}\n"
@@ -1151,6 +1166,121 @@ class ArbitorPhysical:
                     # Часть проигрыша идёт в джекпот
                     target_cell.casino_jackpot += int(bet * 0.3)
                     return f"🎰 ПРОИГРЫШ! Потеряно {bet} {resource}. Джекпот вырос до {target_cell.casino_jackpot}."
+
+            elif action == "DIPLOMACY":
+                target_agent = params.get("target_agent", "ALL")
+                message = str(params.get("message", "")).strip()
+                if not message:
+                    return "Ошибка дипломатии: сообщение не может быть пустым."
+                
+                target_str = str(target_agent).strip()
+                delivered = 0
+
+                if target_str.upper() == "ALL":
+                    for a in all_agents:
+                        if a.name != avatar.name and not a.is_dead:
+                            inbox_entry = f"[{avatar.name} -> ВСЕМ]: {message}"
+                            if not hasattr(a, 'inbox'):
+                                a.inbox = []
+                            a.inbox.append(inbox_entry)
+                            if len(a.inbox) > 3:
+                                a.inbox.pop(0)
+                            delivered += 1
+                    
+                    log_entry = {
+                        "sender": avatar.name,
+                        "receiver": "ALL",
+                        "message": message,
+                        "type": "broadcast",
+                        "time": time.strftime("%H:%M:%S")
+                    }
+                    map_core.diplomacy_log.append(log_entry)
+                    if len(map_core.diplomacy_log) > 100:
+                        map_core.diplomacy_log.pop(0)
+                    
+                    logger.info(f"🕊️ [ДИПЛОМАТИЯ] {avatar.name} -> ВСЕМ: \"{message}\"")
+                    return f"Дипломатическое обращение отправлено ВСЕМ ({delivered} получ.): \"{message}\""
+                else:
+                    recipient = next((a for a in all_agents if a.name.lower() == target_str.lower() and not a.is_dead), None)
+                    if not recipient:
+                        return f"Агент '{target_str}' не найден или мёртв."
+                    
+                    inbox_entry = f"[{avatar.name} -> ВАМ]: {message}"
+                    if not hasattr(recipient, 'inbox'):
+                        recipient.inbox = []
+                    recipient.inbox.append(inbox_entry)
+                    if len(recipient.inbox) > 3:
+                        recipient.inbox.pop(0)
+
+                    log_entry = {
+                        "sender": avatar.name,
+                        "receiver": recipient.name,
+                        "message": message,
+                        "type": "direct",
+                        "time": time.strftime("%H:%M:%S")
+                    }
+                    map_core.diplomacy_log.append(log_entry)
+                    if len(map_core.diplomacy_log) > 100:
+                        map_core.diplomacy_log.pop(0)
+
+                    logger.info(f"🕊️ [ДИПЛОМАТИЯ] {avatar.name} -> {recipient.name}: \"{message}\"")
+                    return f"Дипломатическое сообщение отправлено {recipient.name}: \"{message}\""
+
+            elif action == "GIVE":
+                try:
+                    tx = int(params.get("target_x", 0))
+                    ty = int(params.get("target_y", 0))
+                except (TypeError, ValueError):
+                    return "Неверные координаты цели для передачи ресурсов."
+                
+                if not self.is_adjacent(avatar.position, Position(x=tx, y=ty)) and not (avatar.position.x == tx and avatar.position.y == ty):
+                    return "Цель вне зоны досягаемости (передача возможна только соседним клеткам)."
+                
+                recipient = next((a for a in all_agents if a.position.x == tx and a.position.y == ty and a.name != avatar.name and not a.is_dead), None)
+                if not recipient:
+                    return f"На ({tx}, {ty}) нет живого союзника для передачи ресурсов."
+                
+                resource = str(params.get("resource", "matter")).lower()
+                if resource not in ["matter", "energy", "imagination"]:
+                    return "Неверный тип ресурса для передачи (доступны: matter, energy, imagination)."
+                
+                try:
+                    amount = int(params.get("amount", 0))
+                except (TypeError, ValueError):
+                    return "Неверное количество ресурса."
+                
+                if amount <= 0:
+                    return "Количество передаваемого ресурса должно быть больше 0."
+                
+                if avatar.balance.get(resource, 0) < amount:
+                    return f"Недостаточно {resource} (в наличии: {avatar.balance.get(resource, 0)}, запрошено: {amount})."
+                
+                # Передаем ресурс
+                avatar.balance[resource] -= amount
+                recipient.balance[resource] += amount
+                
+                inbox_msg = f"[{avatar.name}]: Передал вам {amount} {resource}!"
+                if not hasattr(recipient, 'inbox'):
+                    recipient.inbox = []
+                recipient.inbox.append(inbox_msg)
+                if len(recipient.inbox) > 3:
+                    recipient.inbox.pop(0)
+                
+                log_entry = {
+                    "sender": avatar.name,
+                    "receiver": recipient.name,
+                    "message": f"Передача ресурсов: {amount} {resource}",
+                    "type": "transfer",
+                    "resource": resource,
+                    "amount": amount,
+                    "time": time.strftime("%H:%M:%S")
+                }
+                map_core.diplomacy_log.append(log_entry)
+                if len(map_core.diplomacy_log) > 100:
+                    map_core.diplomacy_log.pop(0)
+                
+                logger.info(f"🤝 [РЕСУРСЫ] {avatar.name} передал {amount} {resource} агенту {recipient.name} на ({tx}, {ty})")
+                return f"Успешно передано {amount} {resource} союзнику {recipient.name}!"
 
             return f"Действие {action} обработано."
 

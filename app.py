@@ -230,7 +230,7 @@ def get_state():
             })
         grid_data.append(row)
         
-    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0), "unlocked_techs": getattr(a, 'unlocked_techs', []), "short_term_memory": getattr(a, 'short_term_memory', []), "long_term_memory": getattr(a, 'long_term_memory', ''), "is_rl": getattr(a, 'is_rl', False)} for a in web_state.agents]
+    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0), "unlocked_techs": getattr(a, 'unlocked_techs', []), "short_term_memory": getattr(a, 'short_term_memory', []), "long_term_memory": getattr(a, 'long_term_memory', ''), "is_rl": getattr(a, 'is_rl', False), "inbox": getattr(a, 'inbox', [])} for a in web_state.agents]
     
     return jsonify({
         "started": True,
@@ -239,7 +239,8 @@ def get_state():
         "tick": web_state.tick,
         "map": grid_data,
         "agents": agents_data,
-        "logs": web_state.logs
+        "logs": web_state.logs,
+        "diplomacy_log": web_state.world_map.diplomacy_log if (web_state.world_map and hasattr(web_state.world_map, 'diplomacy_log')) else []
     })
 
 @app.route('/api/human_prompt', methods=['GET'])
@@ -343,10 +344,21 @@ HTML_TEMPLATE = """
             display: flex; align-items: center; justify-content: center; font-size: 10px; z-index: 10;
         }
 
-        .terminal-container { width: 350px; background: #050811; border-left: 1px solid var(--card-border); display: flex; flex-direction: column; }
-        .terminal-header { padding: 12px 16px; background: var(--card-bg); border-bottom: 1px solid var(--card-border); font-weight: 600; font-family: 'JetBrains Mono'; font-size: 14px; }
+        .terminal-container { width: 380px; background: #050811; border-left: 1px solid var(--card-border); display: flex; flex-direction: column; }
+        .terminal-header { padding: 8px 12px; background: var(--card-bg); border-bottom: 1px solid var(--card-border); font-weight: 600; font-family: 'JetBrains Mono'; font-size: 14px; }
         .terminal { flex: 1; padding: 16px; font-family: 'JetBrains Mono', monospace; font-size: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
         
+        .tab-btn {
+            background: transparent; border: none; color: var(--text-muted); padding: 6px 12px;
+            font-size: 12px; font-weight: 600; cursor: pointer; border-radius: 6px; transition: 0.2s;
+            display: flex; align-items: center; gap: 6px; font-family: 'Outfit', sans-serif;
+        }
+        .tab-btn:hover { color: var(--text-main); background: rgba(255,255,255,0.05); }
+        .tab-btn.active { color: #fff; background: rgba(6, 182, 212, 0.15); border: 1px solid rgba(6, 182, 212, 0.35); }
+        .dip-badge {
+            background: #ef4444; color: #fff; font-size: 9px; padding: 1px 5px; border-radius: 10px; font-weight: 700;
+        }
+
         .log-TICK { color: #f59e0b; font-weight: bold; }
         .log-INFO { color: var(--text-muted); }
     </style>
@@ -369,8 +381,12 @@ HTML_TEMPLATE = """
             <div class="map-grid" id="mapGrid"></div>
         </div>
         <div class="terminal-container">
-            <div class="terminal-header">Логи (Real-time)</div>
+            <div class="terminal-header" style="display: flex; gap: 6px; align-items: center;">
+                <button id="tabLogsBtn" class="tab-btn active" onclick="switchRightTab('logs')">📋 Логи (Real-time)</button>
+                <button id="tabDipBtn" class="tab-btn" onclick="switchRightTab('diplomacy')">🕊️ Дипломатия и Переговоры <span id="dipBadge" class="dip-badge" style="display: none;">0</span></button>
+            </div>
             <div class="terminal" id="terminalLog"></div>
+            <div class="terminal" id="terminalDiplomacy" style="display: none; gap: 8px;"></div>
         </div>
     </div>
 
@@ -391,6 +407,8 @@ HTML_TEMPLATE = """
             <button onclick="fillAction('BUILD', {target_x:0, target_y:0})" style="padding:5px; background: #334155; color: white; border: none; cursor: pointer; border-radius: 4px;">BUILD (0,0)</button>
             <button onclick="fillAction('RESEARCH', {tech:'combat_lvl_1'})" style="padding:5px; background: #8b5cf6; color: white; border: none; cursor: pointer; border-radius: 4px;">RESEARCH</button>
             <button onclick="fillAction('GAMBLE', {target_x:0, target_y:0, bet:50, resource:'matter'})" style="padding:5px; background: linear-gradient(135deg, #f59e0b, #ea580c); color: white; border: none; cursor: pointer; border-radius: 4px;">🎰 GAMBLE</button>
+            <button onclick="fillAction('DIPLOMACY', {target_agent:'ALL', message:'Предлагаю союз и разделение сфер влияния!'})" style="padding:5px; background: linear-gradient(135deg, #3b82f6, #1d4ed8); color: white; border: none; cursor: pointer; border-radius: 4px;">🕊️ DIPLOMACY</button>
+            <button onclick="fillAction('GIVE', {target_x:0, target_y:0, resource:'matter', amount:20})" style="padding:5px; background: linear-gradient(135deg, #10b981, #047857); color: white; border: none; cursor: pointer; border-radius: 4px;">🤝 GIVE</button>
             <button onclick="fillAction('PASS', {})" style="padding:5px; background: #64748b; color: white; border: none; cursor: pointer; border-radius: 4px;">PASS</button>
         </div>
     </div>
@@ -485,6 +503,7 @@ HTML_TEMPLATE = """
                     renderAgents(data.agents);
                     renderMap(data.map);
                     renderLogs(data.logs);
+                    renderDiplomacy(data.diplomacy_log);
                 }
             } catch(e) {}
             
@@ -532,6 +551,11 @@ HTML_TEMPLATE = """
                     ? `border-left: 4px solid #a855f7; box-shadow: 0 0 15px rgba(168, 85, 247, 0.15); opacity: ${a.is_dead ? 0.6 : 1};`
                     : `border-left: 4px solid ${color}; opacity: ${a.is_dead ? 0.6 : 1};`;
 
+                // Diplomatic Inbox (last 3 messages)
+                const inboxMsgs = (a.inbox && a.inbox.length > 0)
+                    ? a.inbox.map(m => `<div style="padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 10px; color: #93c5fd;"><span style="color:#60a5fa;">✉️</span> ${m}</div>`).join('')
+                    : '<div style="font-size: 10px; color: #64748b;">(Входящих нет)</div>';
+
                 return `
                 <div class="agent-card" style="${cardStyle}">
                     <h3 style="color: ${color}">${title}</h3>
@@ -548,6 +572,11 @@ HTML_TEMPLATE = """
                     <div style="margin-top: 8px; background: rgba(245,158,11,0.07); border: 1px solid rgba(245,158,11,0.25); border-radius: 8px; padding: 8px;">
                         <div style="font-size: 10px; color: #f59e0b; font-weight: 700; margin-bottom: 4px;">📋 БОРТОВОЙ ЖУРНАЛ</div>
                         ${stmLines}
+                    </div>
+
+                    <div style="margin-top: 8px; background: rgba(59,130,246,0.07); border: 1px solid rgba(59,130,246,0.25); border-radius: 8px; padding: 8px;">
+                        <div style="font-size: 10px; color: #60a5fa; font-weight: 700; margin-bottom: 4px;">📬 ВХОДЯЩИЕ (ДИПЛОМАТИЯ)</div>
+                        ${inboxMsgs}
                     </div>
 
                     <div style="font-size: 10px; color: var(--text-muted); margin-top: 8px; cursor: pointer;" onclick="toggleTechs('${a.name}')">(Нажмите, чтобы увидеть скиллы)</div>
@@ -604,6 +633,104 @@ HTML_TEMPLATE = """
                 }
             }
             mapEl.innerHTML = html;
+        }
+
+        let currentRightTab = 'logs';
+        let lastDiplomacyCount = 0;
+
+        function switchRightTab(tab) {
+            currentRightTab = tab;
+            const logsTab = document.getElementById('terminalLog');
+            const dipTab = document.getElementById('terminalDiplomacy');
+            const logsBtn = document.getElementById('tabLogsBtn');
+            const dipBtn = document.getElementById('tabDipBtn');
+            const badge = document.getElementById('dipBadge');
+
+            if (tab === 'logs') {
+                logsTab.style.display = 'flex';
+                dipTab.style.display = 'none';
+                logsBtn.classList.add('active');
+                dipBtn.classList.remove('active');
+            } else {
+                logsTab.style.display = 'none';
+                dipTab.style.display = 'flex';
+                logsBtn.classList.remove('active');
+                dipBtn.classList.add('active');
+                if (badge) badge.style.display = 'none';
+            }
+        }
+
+        function renderDiplomacy(dipLog) {
+            const term = document.getElementById('terminalDiplomacy');
+            if (!term) return;
+
+            if (!dipLog || dipLog.length === 0) {
+                term.innerHTML = '<div style="color: var(--text-muted); font-size: 11px; text-align: center; margin-top: 20px;">🕊️ Переговоры ещё не начались.<br>Агенты могут предлагать союзы, блефовать или передавать ресурсы.</div>';
+                return;
+            }
+
+            if (currentRightTab !== 'diplomacy') {
+                const diff = dipLog.length - lastDiplomacyCount;
+                const badge = document.getElementById('dipBadge');
+                if (badge && diff > 0) {
+                    badge.innerText = diff > 99 ? '99+' : diff;
+                    badge.style.display = 'inline-block';
+                }
+            } else {
+                lastDiplomacyCount = dipLog.length;
+            }
+
+            const atBottom = term.scrollHeight - term.scrollTop <= term.clientHeight + 30;
+
+            term.innerHTML = dipLog.map(item => {
+                const senderColor = stringToColor(item.sender);
+                const receiverColor = item.receiver === 'ALL' ? '#f59e0b' : stringToColor(item.receiver);
+                const timeStr = item.time ? `[${item.time}] ` : '';
+
+                if (item.type === 'transfer') {
+                    return `
+                    <div style="background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 8px; padding: 8px 10px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                            <div style="font-size: 11px; font-weight: 700;">
+                                <span style="color: ${senderColor}">${item.sender}</span>
+                                <span style="color: #64748b;"> ➔ </span>
+                                <span style="color: ${receiverColor}">${item.receiver}</span>
+                            </div>
+                            <span style="font-size: 9px; color: #64748b;">${timeStr}</span>
+                        </div>
+                        <div style="font-size: 11px; color: #34d399; font-weight: 600;">🤝 ${item.message}</div>
+                    </div>`;
+                } else if (item.receiver === 'ALL' || item.type === 'broadcast') {
+                    return `
+                    <div style="background: rgba(59, 130, 246, 0.08); border: 1px solid rgba(59, 130, 246, 0.25); border-radius: 8px; padding: 8px 10px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                            <div style="font-size: 11px; font-weight: 700;">
+                                <span style="color: ${senderColor}">${item.sender}</span>
+                                <span style="color: #f59e0b; background: rgba(245, 158, 11, 0.15); padding: 1px 4px; border-radius: 4px; font-size: 9px; margin-left: 4px;">📢 ВСЕМ</span>
+                            </div>
+                            <span style="font-size: 9px; color: #64748b;">${timeStr}</span>
+                        </div>
+                        <div style="font-size: 11px; color: #e2e8f0; font-style: italic; line-height: 1.4;">"${item.message}"</div>
+                    </div>`;
+                } else {
+                    return `
+                    <div style="background: rgba(168, 85, 247, 0.08); border: 1px solid rgba(168, 85, 247, 0.25); border-radius: 8px; padding: 8px 10px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                            <div style="font-size: 11px; font-weight: 700;">
+                                <span style="color: ${senderColor}">${item.sender}</span>
+                                <span style="color: #64748b;"> ➔ </span>
+                                <span style="color: ${receiverColor}">✉️ ${item.receiver}</span>
+                            </div>
+                            <span style="font-size: 9px; color: #64748b;">${timeStr}</span>
+                        </div>
+                        <div style="font-size: 11px; color: #e2e8f0; font-style: italic; line-height: 1.4;">"${item.message}"</div>
+                    </div>`;
+                }
+            }).join('');
+
+            if (atBottom) {
+                term.scrollTop = term.scrollHeight;
+            }
         }
 
         function renderLogs(logs) {
