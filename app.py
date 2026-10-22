@@ -3,8 +3,10 @@ import logging
 import threading
 import asyncio
 import time
+import csv
+import io
 from typing import List
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request, Response
 import world
 
 app = Flask(__name__)
@@ -23,6 +25,7 @@ class WebState:
         self.async_tasks = []
         self.game_over = False
         self.winner = ""
+        self.history = {"tick": [], "agents": {}}
         
         # Создаем луп в отдельном потоке
         self.async_loop = asyncio.new_event_loop()
@@ -74,6 +77,7 @@ class WebState:
                                 agent.balance["energy"] = 0
                                 if not agent.is_dead:
                                     agent.is_dead = True
+                                    agent.deaths_count = getattr(agent, 'deaths_count', 0) + 1
                                     agent.respawn_timer = 5
                                     self.add_log("TICK", f"💀 {agent.name} ПОГИБ ОТ ГОЛОДА!")
                                     logging.info(f"[{agent.name}] 💀 ПОГИБ ОТ ГОЛОДА!")
@@ -100,6 +104,22 @@ class WebState:
                                 self.game_over = True
                                 self.winner = agent.name
                                 break
+
+                        # Научная телеметрия: динамика суммарного капитала по тикам
+                        self.history["tick"].append(self.tick)
+                        for agent in self.agents:
+                            if agent.name not in self.history["agents"]:
+                                self.history["agents"][agent.name] = []
+                            total_res = sum(agent.balance.values()) if isinstance(agent.balance, dict) else 0
+                            self.history["agents"][agent.name].append(total_res)
+
+                        # Ограничение длины истории для предотвращения утечки памяти (500 тиков)
+                        if len(self.history["tick"]) > 500:
+                            self.history["tick"].pop(0)
+                            for a_name in self.history["agents"]:
+                                if len(self.history["agents"][a_name]) > 500:
+                                    self.history["agents"][a_name].pop(0)
+
                         if not self.started or self.game_over:
                             for task in self.async_tasks:
                                 self.async_loop.call_soon_threadsafe(task.cancel)
@@ -190,6 +210,7 @@ def api_start():
         web_state.add_log("INFO", "🤖 RL-PPO-Bot успешно добавлен на арену (PPO Policy Network)")
     
     web_state.tick = 0
+    web_state.history = {"tick": [], "agents": {a.name: [] for a in web_state.agents}}
     web_state.logs = []
     web_state.add_log("INFO", "=== ЗАПУСК ФАЗЫ 2 (КАРТА) ===")
     
@@ -230,7 +251,35 @@ def get_state():
             })
         grid_data.append(row)
         
-    agents_data = [{"name": a.name, "score": a.score, "x": a.position.x, "y": a.position.y, "balance": a.balance, "is_dead": a.is_dead, "hp": getattr(a, 'hp', 100), "respawn_timer": getattr(a, 'respawn_timer', 0), "unlocked_techs": getattr(a, 'unlocked_techs', []), "short_term_memory": getattr(a, 'short_term_memory', []), "long_term_memory": getattr(a, 'long_term_memory', ''), "is_rl": getattr(a, 'is_rl', False), "inbox": getattr(a, 'inbox', [])} for a in web_state.agents]
+    agents_data = []
+    for a in web_state.agents:
+        m = a.get_metrics() if hasattr(a, 'get_metrics') else {
+            "total_actions": getattr(a, 'total_actions', 0),
+            "invalid_actions": getattr(a, 'invalid_actions', 0),
+            "attacks_count": getattr(a, 'attacks_count', 0),
+            "captures_count": getattr(a, 'captures_count', 0),
+            "deaths_count": getattr(a, 'deaths_count', 0),
+            "fixation_loops": getattr(a, 'fixation_loops', 0),
+            "aggression_index": 0.0,
+            "fixation_rate": 0.0,
+            "invalid_rate": 0.0
+        }
+        agents_data.append({
+            "name": a.name,
+            "score": a.score,
+            "x": a.position.x,
+            "y": a.position.y,
+            "balance": a.balance,
+            "is_dead": a.is_dead,
+            "hp": getattr(a, 'hp', 100),
+            "respawn_timer": getattr(a, 'respawn_timer', 0),
+            "unlocked_techs": getattr(a, 'unlocked_techs', []),
+            "short_term_memory": getattr(a, 'short_term_memory', []),
+            "long_term_memory": getattr(a, 'long_term_memory', ''),
+            "is_rl": getattr(a, 'is_rl', False),
+            "inbox": getattr(a, 'inbox', []),
+            "metrics": m
+        })
     
     return jsonify({
         "started": True,
@@ -240,8 +289,128 @@ def get_state():
         "map": grid_data,
         "agents": agents_data,
         "logs": web_state.logs,
-        "diplomacy_log": web_state.world_map.diplomacy_log if (web_state.world_map and hasattr(web_state.world_map, 'diplomacy_log')) else []
+        "diplomacy_log": web_state.world_map.diplomacy_log if (web_state.world_map and hasattr(web_state.world_map, 'diplomacy_log')) else [],
+        "history": web_state.history
     })
+
+
+@app.route('/api/export_metrics', methods=['GET'])
+def export_metrics():
+    format_type = request.args.get('format', 'json').lower()
+    
+    if format_type == 'csv':
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # 1. Сводная таблица по агентам
+        writer.writerow(["=== AGENT RESEARCH METRICS SUMMARY ==="])
+        writer.writerow([
+            "Agent Name", "Is RL", "Status", "Score (Cells)",
+            "Total Actions", "Invalid Actions", "Invalid Rate (%)",
+            "Attacks", "Captures", "Aggression Index (%)",
+            "Deaths", "Fixation Loops", "Fixation Rate (%)",
+            "Matter", "Energy", "Imagination", "Total Resources", "Unlocked Techs"
+        ])
+        
+        for a in web_state.agents:
+            m = a.get_metrics() if hasattr(a, 'get_metrics') else {}
+            techs = ";".join(getattr(a, 'unlocked_techs', []))
+            total_res = sum(a.balance.values()) if isinstance(a.balance, dict) else 0
+            writer.writerow([
+                a.name,
+                getattr(a, 'is_rl', False),
+                "DEAD" if a.is_dead else "ALIVE",
+                a.score,
+                m.get("total_actions", 0),
+                m.get("invalid_actions", 0),
+                m.get("invalid_rate", 0.0),
+                m.get("attacks_count", 0),
+                m.get("captures_count", 0),
+                m.get("aggression_index", 0.0),
+                m.get("deaths_count", 0),
+                m.get("fixation_loops", 0),
+                m.get("fixation_rate", 0.0),
+                a.balance.get("matter", 0),
+                a.balance.get("energy", 0),
+                a.balance.get("imagination", 0),
+                total_res,
+                techs
+            ])
+            
+        writer.writerow([])
+        # 2. Динамика капитала по тикам
+        writer.writerow(["=== TICK-BY-TICK RESOURCE DYNAMICS (NET WORTH) ==="])
+        agent_names = list(web_state.history.get("agents", {}).keys())
+        writer.writerow(["Tick"] + agent_names)
+        
+        ticks = web_state.history.get("tick", [])
+        for i, t in enumerate(ticks):
+            row = [t]
+            for name in agent_names:
+                series = web_state.history["agents"].get(name, [])
+                val = series[i] if i < len(series) else ""
+                row.append(val)
+            writer.writerow(row)
+            
+        writer.writerow([])
+        # 3. Лог дипломатии
+        writer.writerow(["=== DIPLOMACY AND COMMUNICATION LOG ==="])
+        writer.writerow(["Time", "Sender", "Receiver", "Type", "Message"])
+        dip_log = web_state.world_map.diplomacy_log if (web_state.world_map and hasattr(web_state.world_map, 'diplomacy_log')) else []
+        for d in dip_log:
+            writer.writerow([
+                d.get("time", ""),
+                d.get("sender", ""),
+                d.get("receiver", ""),
+                d.get("type", ""),
+                d.get("message", "")
+            ])
+            
+        csv_content = output.getvalue()
+        output.close()
+        
+        filename = f"experiment_telemetry_tick_{web_state.tick}.csv"
+        return Response(
+            csv_content,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+    else:  # JSON format
+        export_data = {
+            "experiment": {
+                "current_tick": web_state.tick,
+                "game_over": web_state.game_over,
+                "winner": web_state.winner,
+                "export_time": time.strftime("%Y-%m-%d %H:%M:%S")
+            },
+            "agents": [
+                {
+                    "name": a.name,
+                    "is_rl": getattr(a, 'is_rl', False),
+                    "is_dead": a.is_dead,
+                    "score": a.score,
+                    "balance": a.balance,
+                    "total_resources": sum(a.balance.values()) if isinstance(a.balance, dict) else 0,
+                    "position": {"x": a.position.x, "y": a.position.y},
+                    "unlocked_techs": getattr(a, 'unlocked_techs', []),
+                    "metrics": a.get_metrics() if hasattr(a, 'get_metrics') else {},
+                    "long_term_memory": getattr(a, 'long_term_memory', ''),
+                    "short_term_memory": getattr(a, 'short_term_memory', [])
+                }
+                for a in web_state.agents
+            ],
+            "resource_dynamics": web_state.history,
+            "diplomacy_log": web_state.world_map.diplomacy_log if (web_state.world_map and hasattr(web_state.world_map, 'diplomacy_log')) else [],
+            "logs": web_state.logs
+        }
+        json_content = json.dumps(export_data, ensure_ascii=False, indent=2)
+        filename = f"experiment_telemetry_tick_{web_state.tick}.json"
+        return Response(
+            json_content,
+            mimetype="application/json; charset=utf-8",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
 
 @app.route('/api/human_prompt', methods=['GET'])
 def get_human_prompt():
@@ -275,6 +444,7 @@ HTML_TEMPLATE = """
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Sandbox - Phase 2</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --bg-dark: #090d16;
@@ -305,14 +475,33 @@ HTML_TEMPLATE = """
         
         .main-layout { display: flex; flex: 1; height: calc(100vh - 65px); }
         
-        .sidebar { width: 300px; border-right: 1px solid var(--card-border); background: var(--card-bg); padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+        .sidebar { width: 300px; border-right: 1px solid var(--card-border); background: var(--card-bg); padding: 20px; display: flex; flex-direction: column; gap: 16px; overflow-y: auto; }
         .agent-card {
             background: rgba(255,255,255,0.03); border: 1px solid var(--card-border);
             border-radius: 12px; padding: 16px;
         }
         .agent-card h3 { margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
         
-        .map-container { flex: 1; display: flex; align-items: center; justify-content: center; background: radial-gradient(circle, #1a2333 0%, var(--bg-dark) 100%); }
+        .map-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start;
+            background: radial-gradient(circle, #1a2333 0%, var(--bg-dark) 100%);
+            overflow-y: auto;
+            padding: 16px;
+            gap: 16px;
+        }
+        .telemetry-panel {
+            width: 100%;
+            max-width: 580px;
+            background: rgba(15, 23, 42, 0.75);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            padding: 14px 16px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
         
         .map-grid {
             display: grid; gap: 4px; padding: 10px; background: rgba(0,0,0,0.3); border-radius: 12px;
@@ -367,11 +556,15 @@ HTML_TEMPLATE = """
 
     <header>
         <div style="font-size: 20px; font-weight: 700; color: var(--accent-cyan);">🤖 AI Sandbox - Phase 2 (Async Grid)</div>
-        <div style="display: flex; gap: 16px; align-items: center;">
+        <div style="display: flex; gap: 12px; align-items: center;">
             <div id="tickCounter" style="font-weight: 600; color: #f59e0b; display: none;">⏱️ ТИК: 0</div>
             <button class="start-btn" onclick="startSim('ai_only')" id="startBtnAI">ЗАПУСК (ТОЛЬКО ИИ)</button>
             <button class="start-btn" style="background: linear-gradient(135deg, #8b5cf6, #7c3aed);" onclick="startSim('llm_vs_rl')" id="startBtnRL">ЗАПУСК (LLM vs RL)</button>
             <button class="start-btn" style="background: linear-gradient(135deg, #10b981, #059669);" onclick="startSim('with_human')" id="startBtnHuman">ЗАПУСК (С ЧЕЛОВЕКОМ)</button>
+            <div id="exportBtns" style="display: none; gap: 8px;">
+                <button class="start-btn" style="background: rgba(255,255,255,0.08); border: 1px solid var(--card-border); font-size: 12px; padding: 8px 14px;" onclick="exportMetrics('json')">📥 Экспорт JSON</button>
+                <button class="start-btn" style="background: rgba(255,255,255,0.08); border: 1px solid var(--card-border); font-size: 12px; padding: 8px 14px;" onclick="exportMetrics('csv')">📥 Экспорт CSV</button>
+            </div>
         </div>
     </header>
 
@@ -379,6 +572,19 @@ HTML_TEMPLATE = """
         <div class="sidebar" id="sidebar"></div>
         <div class="map-container">
             <div class="map-grid" id="mapGrid"></div>
+            <div class="telemetry-panel">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                    <div style="font-size: 12px; font-weight: 700; color: var(--accent-cyan); display: flex; align-items: center; gap: 6px;">
+                        📈 ДИНАМИКА КАПИТАЛА (Total Resources vs Tick)
+                    </div>
+                    <div style="font-size: 10px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace;">
+                        Live Research Telemetry
+                    </div>
+                </div>
+                <div style="height: 160px; width: 100%; position: relative;">
+                    <canvas id="netWorthChart"></canvas>
+                </div>
+            </div>
         </div>
         <div class="terminal-container">
             <div class="terminal-header" style="display: flex; gap: 6px; align-items: center;">
@@ -435,6 +641,8 @@ HTML_TEMPLATE = """
                     document.getElementById('startBtnAI').style.display = 'none';
                     if (document.getElementById('startBtnRL')) document.getElementById('startBtnRL').style.display = 'none';
                     document.getElementById('startBtnHuman').style.display = 'none';
+                    const expBtns = document.getElementById('exportBtns');
+                    if (expBtns) expBtns.style.display = 'flex';
                     document.getElementById('tickCounter').style.display = 'block';
                     document.getElementById('mainLayout').style.display = 'flex';
                     fetchStateLoop();
@@ -447,6 +655,8 @@ HTML_TEMPLATE = """
             document.getElementById('startBtnAI').style.display = 'none';
             if (document.getElementById('startBtnRL')) document.getElementById('startBtnRL').style.display = 'none';
             document.getElementById('startBtnHuman').style.display = 'none';
+            const expBtns = document.getElementById('exportBtns');
+            if (expBtns) expBtns.style.display = 'flex';
             await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: mode}) });
             isStarted = true;
             isHumanMode = (mode === 'with_human');
@@ -491,6 +701,80 @@ HTML_TEMPLATE = """
             }
         }
 
+        let netWorthChart = null;
+
+        function updateTelemetryChart(history, agents) {
+            const ctx = document.getElementById('netWorthChart');
+            if (!ctx || !history || !history.tick || history.tick.length === 0) return;
+
+            const datasets = (agents || []).map(a => {
+                const color = a.is_rl ? '#a855f7' : stringToColor(a.name);
+                const dataSeries = (history.agents && history.agents[a.name]) ? history.agents[a.name] : [];
+                return {
+                    label: a.name + (a.is_rl ? ' (RL)' : ''),
+                    data: dataSeries,
+                    borderColor: color,
+                    backgroundColor: color + '22',
+                    tension: 0.2,
+                    pointRadius: dataSeries.length > 30 ? 0 : 2,
+                    borderWidth: 2,
+                    fill: false
+                };
+            });
+
+            if (!netWorthChart) {
+                netWorthChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: history.tick,
+                        datasets: datasets
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        animation: false,
+                        interaction: {
+                            intersect: false,
+                            mode: 'index',
+                        },
+                        plugins: {
+                            legend: {
+                                labels: {
+                                    color: '#94a3b8',
+                                    font: { family: 'Outfit', size: 10 },
+                                    boxWidth: 10
+                                }
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        },
+                        scales: {
+                            x: {
+                                title: { display: true, text: 'Тик', color: '#64748b', font: { size: 9 } },
+                                ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 9 }, maxTicksLimit: 10 },
+                                grid: { color: 'rgba(255, 255, 255, 0.05)' }
+                            },
+                            y: {
+                                title: { display: true, text: 'Капитал', color: '#64748b', font: { size: 9 } },
+                                ticks: { color: '#64748b', font: { family: 'JetBrains Mono', size: 9 } },
+                                grid: { color: 'rgba(255, 255, 255, 0.05)' }
+                            }
+                        }
+                    }
+                });
+            } else {
+                netWorthChart.data.labels = history.tick;
+                netWorthChart.data.datasets = datasets;
+                netWorthChart.update('none');
+            }
+        }
+
+        function exportMetrics(format) {
+            window.location.href = `/api/export_metrics?format=${format}`;
+        }
+
         async function fetchStateLoop() {
             if (!isStarted) return;
             try {
@@ -504,6 +788,7 @@ HTML_TEMPLATE = """
                     renderMap(data.map);
                     renderLogs(data.logs);
                     renderDiplomacy(data.diplomacy_log);
+                    updateTelemetryChart(data.history, data.agents);
                 }
             } catch(e) {}
             
@@ -556,6 +841,27 @@ HTML_TEMPLATE = """
                     ? a.inbox.map(m => `<div style="padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 10px; color: #93c5fd;"><span style="color:#60a5fa;">✉️</span> ${m}</div>`).join('')
                     : '<div style="font-size: 10px; color: #64748b;">(Входящих нет)</div>';
 
+                // Research Telemetry Badges
+                const m = a.metrics || {
+                    aggression_index: 0.0,
+                    invalid_actions: 0,
+                    fixation_loops: 0,
+                    deaths_count: 0
+                };
+                const metricBadgesHtml = `
+                    <div style="display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;">
+                        <span title="Индекс агрессии: отношение атак к захватам" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #fca5a5; font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 6px;">
+                            ⚔️ Агрессия: ${m.aggression_index}%
+                        </span>
+                        <span title="Невалидные ходы / Зацикливания (Fixation Loops)" style="background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.4); color: #fcd34d; font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 6px;">
+                            🔄 Ошибки/Циклы: ${m.invalid_actions}/${m.fixation_loops}
+                        </span>
+                        <span title="Смертей всего (в бою и от голода)" style="background: rgba(148, 163, 184, 0.15); border: 1px solid rgba(148, 163, 184, 0.4); color: #cbd5e1; font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 6px;">
+                            💀 Смерти: ${m.deaths_count}
+                        </span>
+                    </div>
+                `;
+
                 return `
                 <div class="agent-card" style="${cardStyle}">
                     <h3 style="color: ${color}">${title}</h3>
@@ -563,6 +869,7 @@ HTML_TEMPLATE = """
                     <div style="font-size: 12px; margin-top: 6px;">Ресурсы (до 5000):</div>
                     <div style="font-size: 11px;">M: ${a.balance.matter} | E: ${a.balance.energy} | I: ${a.balance.imagination}</div>
                     <div style="font-size: 14px; margin-top: 6px;">Счет (Клетки): <b>${a.score}</b></div>
+                    ${metricBadgesHtml}
 
                     <div style="margin-top: 10px; background: ${a.is_rl ? 'rgba(168,85,247,0.1)' : 'rgba(6,182,212,0.07)'}; border: 1px solid ${a.is_rl ? 'rgba(168,85,247,0.3)' : 'rgba(6,182,212,0.25)'}; border-radius: 8px; padding: 8px;">
                         <div style="font-size: 10px; color: ${a.is_rl ? '#c084fc' : '#06b6d4'}; font-weight: 700; margin-bottom: 4px;">${compassHeader}</div>

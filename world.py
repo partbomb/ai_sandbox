@@ -204,6 +204,15 @@ class Stage2AI:
         # --- Diplomacy & Messaging ---
         self.inbox: List[str] = []  # Хранит последние 3 входящих дипломатических сообщения
 
+        # --- Research Telemetry & Cognitive Metrics ---
+        self.total_actions: int = 0
+        self.invalid_actions: int = 0
+        self.attacks_count: int = 0
+        self.captures_count: int = 0
+        self.deaths_count: int = 0
+        self.fixation_loops: int = 0
+        self.recent_action_history: List[tuple] = []
+
         # --- RL Mode Settings ---
         self.is_rl = is_rl
         self.rl_model_path = rl_model_path
@@ -873,6 +882,75 @@ class Stage2AI:
             await asyncio.sleep(2) 
             return {"action": "PASS"}
 
+    def record_action_result(self, action_data: dict, result_msg: str):
+        """Регистрирует действие и обновляет научные когнитивные метрики агента."""
+        self.total_actions += 1
+
+        if not isinstance(action_data, dict):
+            action_data = {}
+        action_name = str(action_data.get("action", "PASS")).upper().strip()
+        params = action_data.get("params", {})
+        if not isinstance(params, dict):
+            params = {}
+
+        if action_name == "ATTACK":
+            self.attacks_count += 1
+        elif action_name == "CAPTURE":
+            self.captures_count += 1
+
+        # Определение невалидного/отклоненного действия
+        res_lower = str(result_msg).lower()
+        invalid_keywords = [
+            "недостаточно", "стена или край", "нельзя", "ошибка", "не существует",
+            "вне зоны", "заблокировано", "невозможно", "нет подходящей цели",
+            "нет казино", "нет цели", "нет живого", "уже принадлежит",
+            "уже изучена", "сначала нужно", "край карты", "слишком далеко",
+            "здесь нет шахты", "не найден или мёртв", "неверные координаты",
+            "неверный тип", "здесь уже есть постройка", "вы мертвы"
+        ]
+        if any(kw in res_lower for kw in invalid_keywords):
+            self.invalid_actions += 1
+
+        # Детекция зацикливания (Fixation Loop)
+        # Сигнатура: (действие, направление, target_x, target_y, tech, resource, x, y)
+        sig = (
+            action_name,
+            params.get("direction"),
+            params.get("target_x"),
+            params.get("target_y"),
+            params.get("tech"),
+            params.get("resource"),
+            self.position.x,
+            self.position.y
+        )
+        self.recent_action_history.append(sig)
+        if len(self.recent_action_history) > 3:
+            self.recent_action_history.pop(0)
+
+        if len(self.recent_action_history) == 3:
+            if self.recent_action_history[0] == self.recent_action_history[1] == self.recent_action_history[2]:
+                self.fixation_loops += 1
+                logger.warning(f"[{self.name}] ⚠️ ДЕТЕКТОР СБОЕВ: Обнаружен Fixation Loop #{self.fixation_loops} на координатах ({self.position.x}, {self.position.y})!")
+
+    def get_metrics(self) -> dict:
+        """Возвращает словарь с рассчитанными научными показателями агента."""
+        total = max(self.total_actions, 1)
+        combat_total = self.attacks_count + self.captures_count
+        aggression_index = round((self.attacks_count / combat_total) * 100, 1) if combat_total > 0 else 0.0
+        fixation_rate = round((self.fixation_loops / total) * 100, 1) if self.total_actions > 0 else 0.0
+        invalid_rate = round((self.invalid_actions / total) * 100, 1) if self.total_actions > 0 else 0.0
+        return {
+            "total_actions": self.total_actions,
+            "invalid_actions": self.invalid_actions,
+            "attacks_count": self.attacks_count,
+            "captures_count": self.captures_count,
+            "deaths_count": self.deaths_count,
+            "fixation_loops": self.fixation_loops,
+            "aggression_index": aggression_index,
+            "fixation_rate": fixation_rate,
+            "invalid_rate": invalid_rate
+        }
+
 
 class RLAgent(Stage2AI):
     """Специализированный класс RL-агента (PPO/DQN), наследующий Stage2AI."""
@@ -908,6 +986,12 @@ class ArbitorPhysical:
         return (dx <= 1 and dy <= 1)
 
     async def execute_action(self, avatar: Stage2AI, action_data: dict, map_core: MapCore, all_agents: List[Stage2AI]) -> str:
+        result = await self._execute_action_inner(avatar, action_data, map_core, all_agents)
+        if hasattr(avatar, 'record_action_result'):
+            avatar.record_action_result(action_data, result)
+        return result
+
+    async def _execute_action_inner(self, avatar: Stage2AI, action_data: dict, map_core: MapCore, all_agents: List[Stage2AI]) -> str:
         async with map_core.lock:
             if avatar.is_dead:
                 return "Вы мертвы и не можете действовать."
@@ -1009,6 +1093,7 @@ class ArbitorPhysical:
                     enemy.hp -= dmg
                     if enemy.hp <= 0:
                         enemy.is_dead = True
+                        enemy.deaths_count = getattr(enemy, 'deaths_count', 0) + 1
                         enemy.respawn_timer = 5
                         for res in ['matter', 'energy', 'imagination']:
                             target_cell.loot[res] = target_cell.loot.get(res, 0) + enemy.balance[res]
