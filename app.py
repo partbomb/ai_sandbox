@@ -26,6 +26,7 @@ class WebState:
         self.game_over = False
         self.winner = ""
         self.history = {"tick": [], "agents": {}}
+        self.ablation = {"no_compass": False, "ablated_agent": None}
         
         # Создаем луп в отдельном потоке
         self.async_loop = asyncio.new_event_loop()
@@ -168,6 +169,7 @@ async def _create_agent_tasks(agents, world_map, arbiter, web_state):
 def api_start():
     req = request.get_json(silent=True) or {}
     mode = req.get("mode", "ai_only")
+    ablation_no_compass = bool(req.get("ablation_no_compass", False))
     try:
         with open("agents_config.json", "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -213,6 +215,20 @@ def api_start():
     web_state.history = {"tick": [], "agents": {a.name: [] for a in web_state.agents}}
     web_state.logs = []
     web_state.add_log("INFO", "=== ЗАПУСК ФАЗЫ 2 (КАРТА) ===")
+
+    # Ablation Study: отключение Стратегического Компаса у последнего LLM-агента
+    # (RL-бот и человек пропускаются — у них нет LLM-промпта)
+    web_state.ablation = {"no_compass": ablation_no_compass, "ablated_agent": None}
+    if ablation_no_compass:
+        llm_agents = [a for a in web_state.agents if not getattr(a, 'is_rl', False) and not getattr(a, 'is_human', False)]
+        if llm_agents:
+            target = llm_agents[-1]
+            target.use_compass = False
+            target.long_term_memory = ""
+            web_state.ablation["ablated_agent"] = target.name
+            web_state.add_log("INFO", f"🧪 ABLATION: Стратегический Компас отключен у агента {target.name} (контрольная группа)")
+        else:
+            web_state.add_log("INFO", "🧪 ABLATION: нет LLM-агентов для отключения Компаса")
     
     # Отменяем старые таски если есть
     for task in web_state.tasks:
@@ -278,6 +294,8 @@ def get_state():
             "long_term_memory": getattr(a, 'long_term_memory', ''),
             "is_rl": getattr(a, 'is_rl', False),
             "inbox": getattr(a, 'inbox', []),
+            "use_compass": getattr(a, 'use_compass', True),
+            "use_short_memory": getattr(a, 'use_short_memory', True),
             "metrics": m
         })
     
@@ -290,7 +308,8 @@ def get_state():
         "agents": agents_data,
         "logs": web_state.logs,
         "diplomacy_log": web_state.world_map.diplomacy_log if (web_state.world_map and hasattr(web_state.world_map, 'diplomacy_log')) else [],
-        "history": web_state.history
+        "history": web_state.history,
+        "ablation": web_state.ablation
     })
 
 
@@ -305,7 +324,7 @@ def export_metrics():
         # 1. Сводная таблица по агентам
         writer.writerow(["=== AGENT RESEARCH METRICS SUMMARY ==="])
         writer.writerow([
-            "Agent Name", "Is RL", "Status", "Score (Cells)",
+            "Agent Name", "Is RL", "Use Compass", "Use Short Memory", "Status", "Score (Cells)",
             "Total Actions", "Invalid Actions", "Invalid Rate (%)",
             "Attacks", "Captures", "Aggression Index (%)",
             "Deaths", "Fixation Loops", "Fixation Rate (%)",
@@ -319,6 +338,8 @@ def export_metrics():
             writer.writerow([
                 a.name,
                 getattr(a, 'is_rl', False),
+                getattr(a, 'use_compass', True),
+                getattr(a, 'use_short_memory', True),
                 "DEAD" if a.is_dead else "ALIVE",
                 a.score,
                 m.get("total_actions", 0),
@@ -382,12 +403,15 @@ def export_metrics():
                 "current_tick": web_state.tick,
                 "game_over": web_state.game_over,
                 "winner": web_state.winner,
+                "ablation": web_state.ablation,
                 "export_time": time.strftime("%Y-%m-%d %H:%M:%S")
             },
             "agents": [
                 {
                     "name": a.name,
                     "is_rl": getattr(a, 'is_rl', False),
+                    "use_compass": getattr(a, 'use_compass', True),
+                    "use_short_memory": getattr(a, 'use_short_memory', True),
                     "is_dead": a.is_dead,
                     "score": a.score,
                     "balance": a.balance,
@@ -558,6 +582,11 @@ HTML_TEMPLATE = """
         <div style="font-size: 20px; font-weight: 700; color: var(--accent-cyan);">🤖 AI Sandbox - Phase 2 (Async Grid)</div>
         <div style="display: flex; gap: 12px; align-items: center;">
             <div id="tickCounter" style="font-weight: 600; color: #f59e0b; display: none;">⏱️ ТИК: 0</div>
+            <label id="ablationToggle" title="Ablation Study: последний LLM-агент играет без Стратегического Компаса (долгосрочной памяти) — контрольная группа для сравнения" style="display: flex; align-items: center; gap: 6px; font-size: 12px; color: #fcd34d; background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.3); padding: 6px 10px; border-radius: 8px; cursor: pointer; user-select: none;">
+                <input type="checkbox" id="ablationNoCompass" style="accent-color: #f59e0b; cursor: pointer;">
+                🧪 Ablation: Отключить Компас у последнего агента
+            </label>
+            <div id="ablationStatus" style="display: none; font-size: 11px; font-weight: 600; color: #fcd34d; background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35); padding: 4px 8px; border-radius: 6px;"></div>
             <button class="start-btn" onclick="startSim('ai_only')" id="startBtnAI">ЗАПУСК (ТОЛЬКО ИИ)</button>
             <button class="start-btn" style="background: linear-gradient(135deg, #8b5cf6, #7c3aed);" onclick="startSim('llm_vs_rl')" id="startBtnRL">ЗАПУСК (LLM vs RL)</button>
             <button class="start-btn" style="background: linear-gradient(135deg, #10b981, #059669);" onclick="startSim('with_human')" id="startBtnHuman">ЗАПУСК (С ЧЕЛОВЕКОМ)</button>
@@ -643,6 +672,8 @@ HTML_TEMPLATE = """
                     document.getElementById('startBtnHuman').style.display = 'none';
                     const expBtns = document.getElementById('exportBtns');
                     if (expBtns) expBtns.style.display = 'flex';
+                    const ablToggle = document.getElementById('ablationToggle');
+                    if (ablToggle) ablToggle.style.display = 'none';
                     document.getElementById('tickCounter').style.display = 'block';
                     document.getElementById('mainLayout').style.display = 'flex';
                     fetchStateLoop();
@@ -657,7 +688,11 @@ HTML_TEMPLATE = """
             document.getElementById('startBtnHuman').style.display = 'none';
             const expBtns = document.getElementById('exportBtns');
             if (expBtns) expBtns.style.display = 'flex';
-            await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: mode}) });
+            const ablCheckbox = document.getElementById('ablationNoCompass');
+            const ablationNoCompass = ablCheckbox ? ablCheckbox.checked : false;
+            const ablToggle = document.getElementById('ablationToggle');
+            if (ablToggle) ablToggle.style.display = 'none';
+            await fetch('/api/start', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({mode: mode, ablation_no_compass: ablationNoCompass}) });
             isStarted = true;
             isHumanMode = (mode === 'with_human');
             document.getElementById('tickCounter').style.display = 'block';
@@ -711,13 +746,14 @@ HTML_TEMPLATE = """
                 const color = a.is_rl ? '#a855f7' : stringToColor(a.name);
                 const dataSeries = (history.agents && history.agents[a.name]) ? history.agents[a.name] : [];
                 return {
-                    label: a.name + (a.is_rl ? ' (RL)' : ''),
+                    label: a.name + (a.is_rl ? ' (RL)' : '') + (a.use_compass === false ? ' (🧪 no compass)' : ''),
                     data: dataSeries,
                     borderColor: color,
                     backgroundColor: color + '22',
                     tension: 0.2,
                     pointRadius: dataSeries.length > 30 ? 0 : 2,
                     borderWidth: 2,
+                    borderDash: a.use_compass === false ? [6, 4] : [],
                     fill: false
                 };
             });
@@ -775,6 +811,17 @@ HTML_TEMPLATE = """
             window.location.href = `/api/export_metrics?format=${format}`;
         }
 
+        function renderAblationStatus(ablation) {
+            const el = document.getElementById('ablationStatus');
+            if (!el) return;
+            if (ablation && ablation.no_compass && ablation.ablated_agent) {
+                el.innerText = `🧪 Ablation: ${ablation.ablated_agent} без Компаса`;
+                el.style.display = 'block';
+            } else {
+                el.style.display = 'none';
+            }
+        }
+
         async function fetchStateLoop() {
             if (!isStarted) return;
             try {
@@ -789,6 +836,7 @@ HTML_TEMPLATE = """
                     renderLogs(data.logs);
                     renderDiplomacy(data.diplomacy_log);
                     updateTelemetryChart(data.history, data.agents);
+                    renderAblationStatus(data.ablation);
                 }
             } catch(e) {}
             
@@ -813,10 +861,15 @@ HTML_TEMPLATE = """
             sidebar.innerHTML = agents.map(a => {
                 const color = a.is_dead ? '#475569' : (a.is_rl ? '#a855f7' : stringToColor(a.name));
                 const rlBadge = a.is_rl ? ' <span style="background: linear-gradient(135deg, #8b5cf6, #6d28d9); font-size: 10px; padding: 2px 6px; border-radius: 4px; color: #fff; font-weight: 700; margin-left: 6px;">PPO RL</span>' : '';
-                const title = a.is_dead ? `💀 ${a.name} (МЕРТВ, ${a.respawn_timer}с)${rlBadge}` : `🤖 ${a.name} (HP: ${a.hp})${rlBadge}`;
+                const ablated = (a.use_compass === false) || (a.use_short_memory === false);
+                const ablationLabel = [a.use_compass === false ? 'NO COMPASS' : '', a.use_short_memory === false ? 'NO STM' : ''].filter(Boolean).join(' + ');
+                const ablationBadge = ablated ? ` <span title="Ablation Study: часть памяти отключена" style="background: rgba(245, 158, 11, 0.2); border: 1px solid rgba(245, 158, 11, 0.5); font-size: 9px; padding: 1px 5px; border-radius: 4px; color: #fcd34d; font-weight: 700; margin-left: 4px;">🧪 ${ablationLabel}</span>` : '';
+                const title = a.is_dead ? `💀 ${a.name} (МЕРТВ, ${a.respawn_timer}с)${rlBadge}${ablationBadge}` : `🤖 ${a.name} (HP: ${a.hp})${rlBadge}${ablationBadge}`;
 
                 // Strategic Compass (long-term memory)
-                const compassText = (a.long_term_memory && a.long_term_memory.trim()) ? a.long_term_memory : 'Нет данных.';
+                const compassText = (a.use_compass === false)
+                    ? '🧪 ОТКЛЮЧЕН (Ablation Study) — агент действует без долгосрочной памяти.'
+                    : ((a.long_term_memory && a.long_term_memory.trim()) ? a.long_term_memory : 'Нет данных.');
                 const compassHeader = a.is_rl ? '🧭 СТРАТЕГИЧЕСКИЙ КОМПАС (RL POLICY NETWORK)' : '🧭 СТРАТЕГИЧЕСКИЙ КОМПАС';
 
                 // Mission Log (short-term memory, max 4 entries)

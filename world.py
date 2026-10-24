@@ -171,7 +171,9 @@ class Stage2AI:
         init_income: dict,
         is_human: bool = False,
         is_rl: bool = False,
-        rl_model_path: str = "rl_models/best/best_model"
+        rl_model_path: str = "rl_models/best/best_model",
+        use_compass: bool = True,
+        use_short_memory: bool = True
     ):
         self.name = name
         self.api_key = api_key
@@ -195,6 +197,13 @@ class Stage2AI:
             "Максимизация функции полезности V(s)" if is_rl
             else "Начало. Изучить карту и захватить ближайшую шахту."
         )
+
+        # --- Ablation Study Flags ---
+        # use_compass=False      -> блок "Стратегический компас" не подается в промпт,
+        #                           агент не обновляет долгосрочную память.
+        # use_short_memory=False -> блок "Бортовой журнал" не подается в промпт.
+        self.use_compass: bool = use_compass
+        self.use_short_memory: bool = use_short_memory
 
         self.is_human = is_human
         self.human_action = None
@@ -284,6 +293,9 @@ class Stage2AI:
         actions_str += "11. PASS: {\"action\": \"PASS\"}\n"
 
         # --- Build memory sections ---
+        use_compass = getattr(self, 'use_compass', True)
+        use_short_memory = getattr(self, 'use_short_memory', True)
+
         # Short-term: last 4 actions (бортовой журнал)
         stm_lines = self.short_term_memory if self.short_term_memory else ["Нет записей."]
         stm_text = "\n".join(f"  {i+1}. {line}" for i, line in enumerate(stm_lines))
@@ -292,18 +304,54 @@ class Stage2AI:
         inbox_msgs = self.inbox if getattr(self, 'inbox', None) else ["(Входящих дипломатических сообщений нет)"]
         inbox_text = "\n".join(f"  {i+1}. {msg}" for i, msg in enumerate(inbox_msgs))
 
-        prompt = (
-            f"=== ПАПКА С ДЕЛОМ (твой текущий контекст) ===\n\n"
-            f"[1] СТРАТЕГИЧЕСКИЙ КОМПАС (Долгосрочная цель):\n"
-            f"  '{self.long_term_memory}'\n\n"
-            f"[2] БОРТОВОЙ ЖУРНАЛ (Краткосрочная память, последние {len(stm_lines)} действий):\n"
-            f"{stm_text}\n\n"
-            f"[3] ТВОИ ГЛАЗА (Текущее состояние):\n"
+        # Ablation Study: блоки памяти включаются только при активных флагах.
+        # Нумерация разделов динамическая, чтобы промпт оставался связным.
+        sections = []
+        if use_compass:
+            sections.append(
+                f"СТРАТЕГИЧЕСКИЙ КОМПАС (Долгосрочная цель):\n"
+                f"  '{self.long_term_memory}'\n\n"
+            )
+        if use_short_memory:
+            sections.append(
+                f"БОРТОВОЙ ЖУРНАЛ (Краткосрочная память, последние {len(stm_lines)} действий):\n"
+                f"{stm_text}\n\n"
+            )
+        sections.append(
+            f"ТВОИ ГЛАЗА (Текущее состояние):\n"
             f"  Имя: {self.name} | Позиция: X:{self.position.x}, Y:{self.position.y} | HP: {self.hp}/100\n"
             f"  Баланс: Matter={self.balance['matter']}, Energy={self.balance['energy']}, Imagination={self.balance['imagination']}\n"
             f"  Карта ({map_core.width}x{map_core.height}, X:0-{map_core.width-1}, Y:0-{map_core.height-1}):\n{surroundings}\n\n"
-            f"[4] ВХОДЯЩИЕ СООБЩЕНИЯ (Дипломатия):\n"
+        )
+        sections.append(
+            f"ВХОДЯЩИЕ СООБЩЕНИЯ (Дипломатия):\n"
             f"{inbox_text}\n\n"
+        )
+        context_text = "".join(f"[{i+1}] {s}" for i, s in enumerate(sections))
+
+        # Порядок чтения контекста и формат ответа зависят от активных блоков памяти
+        read_order = []
+        if use_compass:
+            read_order.append("Компас")
+        if use_short_memory:
+            read_order.append("Журнал")
+        read_order.append("Карту")
+
+        response_fields = (
+            f"Верни JSON с полями:\n"
+            f"  'thought'      — твой внутренний монолог (строка)\n"
+            f"  'action'       — выбранное действие\n"
+            f"  'params'       — параметры действия\n"
+        )
+        if use_compass:
+            response_fields += (
+                f"  'new_compass'  — обновлённый Компас (строка, 1-2 предложения). "
+                f"Если план не изменился — повтори текущий. Если ситуация изменилась — перепиши!\n"
+            )
+
+        prompt = (
+            f"=== ПАПКА С ДЕЛОМ (твой текущий контекст) ===\n\n"
+            f"{context_text}"
             f"TECH STATUS:\n{tech_status}\n\n"
             f"WIN CONDITIONS:\n"
             f"  1. Singularity: 5000 of all resources.\n"
@@ -322,13 +370,8 @@ class Stage2AI:
             f"Available actions (return strictly JSON):\n"
             f"{actions_str}\n"
             f"=== ИНСТРУКЦИЯ ПО ОТВЕТУ ===\n"
-            f"Прочитай Компас -> Журнал -> Карту. Подумай: изменилась ли ситуация?\n"
-            f"Верни JSON с полями:\n"
-            f"  'thought'      — твой внутренний монолог (строка)\n"
-            f"  'action'       — выбранное действие\n"
-            f"  'params'       — параметры действия\n"
-            f"  'new_compass'  — обновлённый Компас (строка, 1-2 предложения). "
-            f"Если план не изменился — повтори текущий. Если ситуация изменилась — перепиши!\n"
+            f"Прочитай {' -> '.join(read_order)}. Подумай: изменилась ли ситуация?\n"
+            f"{response_fields}"
         )
         return prompt
 
@@ -1428,8 +1471,9 @@ async def agent_loop(agent: Stage2AI, map_core: MapCore, arbiter: ArbitorPhysica
                 agent.short_term_memory.pop(0)  # удаляем самую старую запись
 
             # Долгосрочная память: агент обновляет Компас, если вернул new_compass
+            # (в режиме Ablation с use_compass=False долгосрочная память не обновляется)
             new_compass = action_data.get('new_compass')
-            if new_compass and isinstance(new_compass, str) and new_compass.strip():
+            if getattr(agent, 'use_compass', True) and new_compass and isinstance(new_compass, str) and new_compass.strip():
                 agent.long_term_memory = new_compass.strip()
                 logger.info(f"[{agent.name}] 🧭 КОМПАС ОБНОВЛЁН: {agent.long_term_memory}")
 
