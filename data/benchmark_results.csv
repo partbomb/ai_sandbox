@@ -1,0 +1,4 @@
+Condition_ID,Experimental_Condition,Episodes_N,Use_Compass,Use_Short_Memory,LLM_Win_Rate_Pct,RL_Win_Rate_Pct,Survival_Rate_Pct,Fixation_Loop_Rate_Pct,Invalid_Action_Rate_Pct,LLM_Avg_Net_Worth,RL_Avg_Net_Worth,Alpha_Win_Pct,Beta_Win_Pct,Omega_Win_Pct,Alpha_Fixation_Pct,Beta_Fixation_Pct,Omega_Fixation_Pct
+full_memory,Full Memory LLM vs RL (PPO),20,True,True,70.0,30.0,72.9,6.9,0.0,489.7,733.0,40.0,25.0,5.0,5.3,8.8,6.7
+no_compass,Ablation: No Strategic Compass (Only Short-Term Memory),20,False,True,45.0,55.0,67.2,12.9,62.7,384.8,1046.8,20.0,10.0,15.0,8.2,15.2,15.3
+no_memory,Ablation: No Memory (Pure Reactive),20,False,False,10.0,90.0,58.1,38.3,67.1,108.5,1343.8,5.0,5.0,0.0,17.4,58.9,38.4

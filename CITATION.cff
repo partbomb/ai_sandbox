@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use AI Sandbox in your research, coursework, or benchmarks, please cite it using the metadata below."
+type: software
+title: "AI Sandbox: Emergent Behavioral Archetypes, Cognitive Fixation, and Specification Gaming in Multi-Agent LLM and RL Environments"
+abstract: >-
+  An open-source multi-agent experimental testbed for studying emergent
+  behavioral archetypes (Warlord, Economist, Pilgrim), cognitive failure modes
+  (perseveration loops, temporal discounting), Machiavellian diplomacy, dual-memory
+  ablation, and reinforcement learning specification gaming under resource-constrained
+  survival conditions.
+authors:
+  - family-names: "Daribai"
+    given-names: "Kuanysh"
+repository-code: "https://github.com/partbomb/ai_sandbox"
+url: "https://github.com/partbomb/ai_sandbox"
+license: MIT
+version: "2.5.0"
+date-released: "2026-10-24"
+keywords:
+  - "large-language-models"
+  - "multi-agent-systems"
+  - "reinforcement-learning"
+  - "emergent-behavior"
+  - "ai-safety"
+  - "specification-gaming"
+  - "cognitive-architecture"
+  - "ablation-study"

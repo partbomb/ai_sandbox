@@ -1,15 +1,27 @@
-/agents_config.json
+# Virtual environments
 venv/
 .venv/
+
+# Python bytecode & build artifacts
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 *.egg-info/
 dist/
 build/
-first_run.txt
+
+# Secrets & local configurations (use agents_config.example.json as template)
+agents_config.json
 .env
 *.env
+
+# OS & IDE files
 .DS_Store
 .idea/
 .vscode/
+
+# RL intermediate checkpoints (keep trained best_model.zip for reviewers!)
+rl_models/*.zip
+!rl_models/best/
+!rl_models/best/best_model.zip

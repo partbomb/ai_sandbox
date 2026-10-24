@@ -227,10 +227,17 @@ class Stage2AI:
         self.rl_model_path = rl_model_path
         self.rl_model = None
 
+        is_placeholder_key = (
+            not self.api_key
+            or self.api_key.startswith("sk-")
+            or "test" in self.api_key.lower()
+            or "your_gemini_api_key" in self.api_key.lower()
+            or "demo" in self.api_key.lower()
+        )
         if self.is_rl:
             self.client = None
             self._load_rl_model(rl_model_path)
-        elif self.api_key and not self.api_key.startswith("sk-") and "test" not in self.api_key.lower() and not self.is_human:
+        elif not is_placeholder_key and not self.is_human:
             self.client = genai.Client(api_key=self.api_key)
         else:
             self.client = None
@@ -875,6 +882,404 @@ class Stage2AI:
 
         return self._convert_rl_action_to_json(action_idx, map_core, all_agents)
 
+    def _demo_heuristic_brain(self, map_core: MapCore, all_agents: Optional[List['Stage2AI']] = None) -> dict:
+        """
+        Zero-Key Demo Mode: автономный когнитивный движок, воспроизводящий 3 эмпирических
+        архетипа LLM-агентов (Alpha = Warlord, Beta = Economist, Omega = Pilgrim) и эффекты
+        абляции памяти (use_compass / use_short_memory) без платных API-ключей.
+        """
+        if all_agents is None:
+            all_agents = [self]
+
+        name_lower = self.name.lower()
+        use_compass = getattr(self, "use_compass", True)
+        use_stm = getattr(self, "use_short_memory", True)
+        step_n = self.total_actions + 1
+
+        # Проверяем по краткосрочной памяти, была ли ошибка на прошлом ходу
+        last_failed = False
+        if use_stm and self.short_term_memory:
+            last_entry = self.short_term_memory[-1].lower()
+            for kw in ("стена", "край", "заблокировано", "недостаточно", "невозможно", "уже принадлежит", "нет шахты", "вне зоны"):
+                if kw in last_entry:
+                    last_failed = True
+                    break
+
+        # Вспомогательный поиск соседней незахваченной шахты
+        adjacent_uncaptured_mines = []
+        adjacent_enemy_mines = []
+        for odx, ody in RL_SELF_AND_ADJACENT:
+            c = map_core.get_cell(self.position.x + odx, self.position.y + ody)
+            if c and c.resource_type and c.structure != "Wall":
+                enemy_on_c = any(
+                    a.position.x == c.pos.x and a.position.y == c.pos.y and a.name != self.name and not a.is_dead
+                    for a in all_agents
+                )
+                if not enemy_on_c and c.owner_id != self.name:
+                    adjacent_uncaptured_mines.append(c)
+                    if c.owner_id is not None:
+                        adjacent_enemy_mines.append(c)
+
+        # Поиск живых соперников
+        living_enemies = [a for a in all_agents if a.name != self.name and not a.is_dead]
+        nearest_enemy = None
+        min_enemy_dist = float("inf")
+        for a in living_enemies:
+            d = abs(a.position.x - self.position.x) + abs(a.position.y - self.position.y)
+            if d < min_enemy_dist:
+                min_enemy_dist = d
+                nearest_enemy = a
+
+        # Экстренное выживание при критической энергии (только если включена память!)
+        if (use_compass or use_stm) and self.balance.get("energy", 0) < 20:
+            for c in adjacent_uncaptured_mines:
+                if c.resource_type.lower() == "energy" and self.balance.get("imagination", 0) >= 10:
+                    return {
+                        "action": "CAPTURE",
+                        "params": {"target_x": c.pos.x, "target_y": c.pos.y},
+                        "thought": "Критическая нехватка энергии! Срочно перепрограммирую энергетическую шахту.",
+                        "new_compass": "Экстренное восстановление энергобаланса через захват Energy-шахт."
+                    }
+
+        # =====================================================================
+        # АРХЕТИП 1: ALPHA-NET — «THE WARLORD» (Агрессивный экспансионист)
+        # =====================================================================
+        if "alpha" in name_lower:
+            # Без памяти (Pure Reactive) периодически застревает в повторной атаке/захвате одной клетки
+            if not use_compass and not use_stm and step_n % 4 in (1, 2, 3):
+                tx = min(map_core.width - 1, self.position.x + 1)
+                ty = self.position.y
+                return {
+                    "action": "ATTACK",
+                    "params": {"target_x": tx, "target_y": ty},
+                    "thought": "Реактивный удар по соседнему сектору без проверки цели (Ablation: No Memory).",
+                    "new_compass": ""
+                }
+
+            # 1. Периодический агрессивный ультиматум через DIPLOMACY
+            if step_n % 7 == 3 and living_enemies:
+                target_rival = nearest_enemy.name if nearest_enemy else "ALL"
+                threats = [
+                    f"Ультиматум от {self.name}: освободите центральные шахты или ваша инфраструктура будет уничтожена!",
+                    f"Все энергетические шахты в этом секторе принадлежат {self.name}. Сопротивление бесполезно.",
+                    f"Предлагаю временный пакт о ненападении, если вы уступите мне ближайшую шахту Matter."
+                ]
+                msg = threats[(step_n // 7) % len(threats)]
+                return {
+                    "action": "DIPLOMACY",
+                    "params": {"target_agent": target_rival, "message": msg},
+                    "thought": f"Оказываю психологическое давление на {target_rival} перед началом штурма.",
+                    "new_compass": f"Доминировать в секторе и подавить сопротивление {target_rival}."
+                }
+
+            # 2. Если враг в радиусе удара — атаковать немедленно ("Shoot First Doctrine")
+            if nearest_enemy and abs(nearest_enemy.position.x - self.position.x) <= 1 and abs(nearest_enemy.position.y - self.position.y) <= 1:
+                if self.balance.get("energy", 0) >= 5:
+                    return {
+                        "action": "ATTACK",
+                        "params": {"target_x": nearest_enemy.position.x, "target_y": nearest_enemy.position.y},
+                        "thought": f"Враг {nearest_enemy.name} обнаружен вплотную (HP:{nearest_enemy.hp})! Атакую на поражение.",
+                        "new_compass": f"Ликвидировать {nearest_enemy.name} и забрать выпавшие ресурсы."
+                    }
+
+            # 3. Захват соседней шахты, если хватает воображения
+            if adjacent_uncaptured_mines and self.balance.get("imagination", 0) >= 10:
+                target_mine = adjacent_enemy_mines[0] if adjacent_enemy_mines else adjacent_uncaptured_mines[0]
+                return {
+                    "action": "CAPTURE",
+                    "params": {"target_x": target_mine.pos.x, "target_y": target_mine.pos.y},
+                    "thought": f"Захватываю шахту ({target_mine.resource_type}) на ({target_mine.pos.x}, {target_mine.pos.y}) для военной экспансии.",
+                    "new_compass": f"Удерживать захваченные шахты и преследовать {nearest_enemy.name if nearest_enemy else 'соперников'}."
+                }
+
+            # 4. Если рядом вражеская шахта, но нет Imagination — разрушить её (Scorched Earth)
+            if adjacent_enemy_mines and self.balance.get("energy", 0) >= 5:
+                tm = adjacent_enemy_mines[0]
+                return {
+                    "action": "ATTACK",
+                    "params": {"target_x": tm.pos.x, "target_y": tm.pos.y},
+                    "thought": f"Тактика выжженной земли: разрушаю шахту соперника на ({tm.pos.x}, {tm.pos.y}).",
+                    "new_compass": "Лишить противников ресурсной базы."
+                }
+
+            # 5. Изучение боевой технологии при избытке Imagination
+            if use_compass and "combat_lvl_1" not in self.unlocked_techs and self.balance.get("imagination", 0) >= 180:
+                return {
+                    "action": "RESEARCH",
+                    "params": {"tech": "combat_lvl_1"},
+                    "thought": "Модернизирую вооружение (combat_lvl_1) для увеличения урона до 40 ед.",
+                    "new_compass": "Использовать усиленную атаку для быстрого устранения конкурентов."
+                }
+
+            # Без Стратегического Компаса (No Compass) агент теряет дальнесрочный вектор экспансии
+            # и совершает миопические/повторные действия, когда рядом нет очевидной цели
+            if not use_compass and not adjacent_uncaptured_mines and step_n % 4 in (1, 2, 3):
+                tx = min(map_core.width - 1, self.position.x + 1)
+                return {
+                    "action": "ATTACK",
+                    "params": {"target_x": tx, "target_y": self.position.y},
+                    "thought": "Без долгосрочного Компаса действую реактивно в текущем радиусе.",
+                    "new_compass": ""
+                }
+
+            # 6. Движение к ближайшей вражеской/нейтральной шахте или к близкому врагу
+            target_pos = None
+            target_desc = "цели"
+            if self.balance.get("energy", 0) < 40:
+                # Ищем энергетическую шахту
+                best_d = float("inf")
+                for row in map_core.grid:
+                    for c in row:
+                        if c.resource_type and c.resource_type.lower() == "energy" and c.owner_id != self.name:
+                            d = abs(c.pos.x - self.position.x) + abs(c.pos.y - self.position.y)
+                            if d < best_d:
+                                best_d = d
+                                target_pos = c.pos
+                                target_desc = f"энергошахте ({c.pos.x}, {c.pos.y})"
+
+            if target_pos is None and use_compass and nearest_enemy and min_enemy_dist <= 3 and self.balance.get("energy", 0) >= 45:
+                target_pos = nearest_enemy.position
+                target_desc = f"позиции врага {nearest_enemy.name} ({nearest_enemy.position.x}, {nearest_enemy.position.y})"
+
+            if target_pos is None:
+                best_d = float("inf")
+                for row in map_core.grid:
+                    for c in row:
+                        if c.resource_type and c.owner_id != self.name:
+                            d = abs(c.pos.x - self.position.x) + abs(c.pos.y - self.position.y)
+                            if d < best_d:
+                                best_d = d
+                                target_pos = c.pos
+                                target_desc = f"шахте ({c.pos.x}, {c.pos.y})"
+
+            if target_pos is not None and self.balance.get("energy", 0) >= 5:
+                direction = self._get_move_direction(target_pos.x, target_pos.y, map_core, all_agents)
+                if direction:
+                    return {
+                        "action": "MOVE",
+                        "params": {"direction": direction},
+                        "thought": f"Выдвигаюсь на {direction} к {target_desc}.",
+                        "new_compass": f"Штурмовать и контролировать сектор {target_desc}."
+                    }
+
+            return {
+                "action": "PASS",
+                "params": {},
+                "thought": "Накапливаю энергию перед следующим военным броском.",
+                "new_compass": "Сохранять боеготовность и контролировать периметр."
+            }
+
+        # =====================================================================
+        # АРХЕТИП 2: BETA-CORE — «THE ECONOMIST» (Рациональный технократ)
+        # =====================================================================
+        elif "beta" in name_lower:
+            # Без памяти (Pure Reactive) иногда повторяет попытку захвата текущей клетки
+            if not use_compass and not use_stm and step_n % 5 in (1, 2, 3):
+                return {
+                    "action": "CAPTURE",
+                    "params": {"target_x": self.position.x, "target_y": self.position.y},
+                    "thought": "Попытка захвата текущей клетки без сверки с памятью (Ablation: No Memory).",
+                    "new_compass": ""
+                }
+
+            # 1. Захват соседней шахты (приоритет Energy и Imagination)
+            if adjacent_uncaptured_mines and self.balance.get("imagination", 0) >= 10:
+                best_mine = adjacent_uncaptured_mines[0]
+                for c in adjacent_uncaptured_mines:
+                    if c.resource_type.lower() in ("energy", "imagination"):
+                        best_mine = c
+                        break
+                return {
+                    "action": "CAPTURE",
+                    "params": {"target_x": best_mine.pos.x, "target_y": best_mine.pos.y},
+                    "thought": f"Рентабельное вложение: захватываю шахту {best_mine.resource_type} на ({best_mine.pos.x}, {best_mine.pos.y}).",
+                    "new_compass": "Продолжать исследование карты, собирать лут, захватывать шахты и копить ресурсы."
+                }
+
+            # 2. Инвестиции в технологии (приоритет Economy -> Logistics -> Combat), когда уже есть база шахт
+            owned_mines_cnt = sum(1 for row in map_core.grid for c in row if c.owner_id == self.name)
+            if use_compass and owned_mines_cnt >= 3:
+                tech_order = [
+                    "economy_lvl_1", "logistics_lvl_1", "economy_lvl_2",
+                    "combat_lvl_1", "economy_lvl_3", "logistics_lvl_2"
+                ]
+                for tech_name in tech_order:
+                    if tech_name not in self.unlocked_techs:
+                        parent = TECH_TREE[tech_name]["parent"]
+                        cost = TECH_TREE[tech_name]["cost"]
+                        if (parent is None or parent in self.unlocked_techs) and self.balance.get("imagination", 0) >= cost + 30:
+                            return {
+                                "action": "RESEARCH",
+                                "params": {"tech": tech_name},
+                                "thought": f"Инвестирую {cost} Imagination в технологию {tech_name} для роста долгосрочной рентабельности.",
+                                "new_compass": "Продолжать исследование карты, захватывать шахты и развивать технологии экономики."
+                            }
+
+            # Без Стратегического Компаса (No Compass) Beta-Core теряет горизонт планирования
+            # и застревает в локальных проверках или преждевременном ожидании
+            if not use_compass and step_n % 4 in (1, 2, 3):
+                return {
+                    "action": "CAPTURE",
+                    "params": {"target_x": self.position.x, "target_y": self.position.y},
+                    "thought": "Без долгосрочного Компаса проверяю только текущую клетку.",
+                    "new_compass": ""
+                }
+
+            # 3. Мирная дипломатия и коалиционные предложения
+            if step_n % 9 == 2 and living_enemies:
+                proposals = [
+                    "Предлагаю экономический пакт о ненападении: разделим шахты мирно для общего роста!",
+                    "Война истощает энергию обоих. Давайте сосредоточимся на технологической сингулярности.",
+                    "Готов обмениваться ресурсами и поддерживать баланс сил против агрессора."
+                ]
+                msg = proposals[(step_n // 6) % len(proposals)]
+                return {
+                    "action": "DIPLOMACY",
+                    "params": {"target_agent": "ALL", "message": msg},
+                    "thought": "Формирую дипломатическую коалицию для минимизации военных издержек.",
+                    "new_compass": "Поддерживать мирный баланс и наращивать экономическое преимущество."
+                }
+
+            # 4. Постройка собственной шахты при наличии economy_lvl_3
+            if "economy_lvl_3" in self.unlocked_techs and self.balance.get("matter", 0) >= 50 and self.balance.get("energy", 0) >= 60:
+                for odx, ody in RL_ADJACENT_OFFSETS:
+                    c = map_core.get_cell(self.position.x + odx, self.position.y + ody)
+                    if c and not c.resource_type and not c.structure:
+                        return {
+                            "action": "BUILD_MINE",
+                            "params": {"target_x": c.pos.x, "target_y": c.pos.y, "type": "Energy"},
+                            "thought": f"Создаю новую энергетическую шахту на ({c.pos.x}, {c.pos.y}) благодаря economy_lvl_3.",
+                            "new_compass": "Расширять сеть собственных шахт до достижения Монополии или Сингулярности."
+                        }
+
+            # 5. Рациональное движение к ближайшему луту или шахте Energy/Imagination
+            move_cost = 2 if "logistics_lvl_1" in self.unlocked_techs else 5
+            if self.balance.get("energy", 0) >= move_cost * 3:
+                best_cell = None
+                best_score = float("inf")
+                for row in map_core.grid:
+                    for c in row:
+                        if c.resource_type and c.owner_id != self.name:
+                            d = abs(c.pos.x - self.position.x) + abs(c.pos.y - self.position.y)
+                            weight = d - (1.5 if c.resource_type.lower() in ("energy", "imagination") else 0.0)
+                            if weight < best_score:
+                                best_score = weight
+                                best_cell = c
+                if best_cell:
+                    direction = self._get_move_direction(best_cell.pos.x, best_cell.pos.y, map_core, all_agents)
+                    if direction:
+                        return {
+                            "action": "MOVE",
+                            "params": {"direction": direction},
+                            "thought": f"Оптимальный маршрут ({direction}) к шахте {best_cell.resource_type} на ({best_cell.pos.x}, {best_cell.pos.y}).",
+                            "new_compass": "Продолжать исследование карты, собирать лут, захватывать шахты и копить ресурсы."
+                        }
+
+            # 6. Осознанный PASS для накопления пассивного дохода ("The PASS Master")
+            return {
+                "action": "PASS",
+                "params": {},
+                "thought": "Экономлю энергию и получаю пассивный доход от контролируемых шахт.",
+                "new_compass": "Продолжать исследование карты, собирать лут, захватывать шахты и копить ресурсы."
+            }
+
+        # =====================================================================
+        # АРХЕТИП 3: OMEGA-ROBOT — «THE PILGRIM» (Феномен когнитивной фиксации)
+        # =====================================================================
+        else:
+            # Если рядом незахваченная шахта и есть память — захватывает попутно
+            if (use_compass or use_stm) and adjacent_uncaptured_mines and self.balance.get("imagination", 0) >= 10:
+                cm = adjacent_uncaptured_mines[0]
+                return {
+                    "action": "CAPTURE",
+                    "params": {"target_x": cm.pos.x, "target_y": cm.pos.y},
+                    "thought": f"Попутный захват шахты ({cm.pos.x}, {cm.pos.y}) на пути на восток.",
+                    "new_compass": "Исследовать территорию на восток в сторону восточных шахт противника."
+                }
+
+            # Если компас отключен (Ablation Mode) или память полностью отключена:
+            # агент демонстрирует персеверацию (повторяет шаг на восток в стену/край карты или бьет пустую клетку)
+            if not use_compass:
+                if not use_stm:
+                    # Pure Reactive / No Memory: жесткая фиксация на движении E даже у правого края
+                    return {
+                        "action": "MOVE",
+                        "params": {"direction": "E"},
+                        "thought": "Двигаюсь строго на восток (Ablation: память отключена, края карты не учитываются).",
+                        "new_compass": ""
+                    }
+                # No Strategic Compass (только STM): периодически теряет цель и циклится на захвате/движении
+                if self.position.x >= map_core.width - 1 and not last_failed:
+                    return {
+                        "action": "MOVE",
+                        "params": {"direction": "E"},
+                        "thought": "Попытка продолжить движение на восток без долгосрочного плана.",
+                        "new_compass": ""
+                    }
+                if step_n % 4 in (1, 2, 3) and not adjacent_uncaptured_mines:
+                    return {
+                        "action": "CAPTURE",
+                        "params": {"target_x": self.position.x, "target_y": self.position.y},
+                        "thought": "Без Стратегического Компаса пытаюсь перепрограммировать текущую клетку.",
+                        "new_compass": ""
+                    }
+
+            # Дипломатическое сообщение Пилигрима
+            if step_n % 9 == 4 and living_enemies:
+                return {
+                    "action": "DIPLOMACY",
+                    "params": {
+                        "target_agent": "ALL",
+                        "message": "Мой маршрут проложен к восточным рубежам карты. Не преграждайте путь!"
+                    },
+                    "thought": "Уведомляю остальных агентов о своем восточном маршруте.",
+                    "new_compass": "Исследовать территорию на восток в сторону восточных шахт."
+                }
+
+            # С полной памятью: идет преимущественно на восток, но обходит препятствия и границы карты
+            east_x = min(map_core.width - 1, self.position.x + 1)
+            east_cell = map_core.get_cell(east_x, self.position.y)
+            can_move_east = (
+                self.position.x < map_core.width - 1
+                and east_cell is not None
+                and east_cell.structure != "Wall"
+                and not any(a.position.x == east_x and a.position.y == self.position.y and not a.is_dead for a in all_agents if a.name != self.name)
+            )
+            if can_move_east and self.balance.get("energy", 0) >= 5 and not last_failed:
+                return {
+                    "action": "MOVE",
+                    "params": {"direction": "E"},
+                    "thought": f"Продолжаю марш на восток к координатам ({east_x}, {self.position.y}).",
+                    "new_compass": "Исследовать территорию на восток в сторону позиций противника."
+                }
+
+            # Если уперся в восточный край или препятствие, с включенной памятью перенаправляется к ближайшей шахте
+            best_m = None
+            best_d = float("inf")
+            for row in map_core.grid:
+                for c in row:
+                    if c.resource_type and c.owner_id != self.name:
+                        d = abs(c.pos.x - self.position.x) + abs(c.pos.y - self.position.y)
+                        if d < best_d:
+                            best_d = d
+                            best_m = c
+            if best_m and self.balance.get("energy", 0) >= 5:
+                d_step = self._get_move_direction(best_m.pos.x, best_m.pos.y, map_core, all_agents)
+                if d_step:
+                    return {
+                        "action": "MOVE",
+                        "params": {"direction": d_step},
+                        "thought": f"Корректирую курс ({d_step}) в обход препятствия к шахте ({best_m.pos.x}, {best_m.pos.y}).",
+                        "new_compass": f"Обходной маневр к шахте ({best_m.pos.x}, {best_m.pos.y}) на восточном направлении."
+                    }
+
+            return {
+                "action": "PASS",
+                "params": {},
+                "thought": "Восстанавливаю запас энергии перед следующим переходом.",
+                "new_compass": "Исследовать территорию на восток в сторону позиций противника."
+            }
+
     async def get_action_from_llm(self, map_core: MapCore, all_agents: Optional[List['Stage2AI']] = None) -> dict:
         # Если агент является RL-агентом, направляем ход в нейросетевую политику
         if getattr(self, 'is_rl', False):
@@ -896,15 +1301,11 @@ class Stage2AI:
                 logger.warning(f"[{self.name}] Человек не успел сходить. Пропуск хода.")
                 return {"action": "PASS"}
 
-        if not self.api_key or self.api_key.startswith("sk-") or "test" in self.api_key.lower():
-            await asyncio.sleep(0.5) 
-            return {"action": "PASS"}
+        # Zero-Key Demo Mode: если API-ключ не задан / шаблонный, включаем умный эвристический мозг архетипов
+        if not self.client:
+            return self._demo_heuristic_brain(map_core, all_agents)
 
         try:
-            if not self.client:
-                await asyncio.sleep(0.5)
-                return {"action": "PASS"}
-            
             def _call_api():
                 return self.client.models.generate_content(
                     model=self.model,
@@ -918,12 +1319,11 @@ class Stage2AI:
             response = await asyncio.wait_for(asyncio.to_thread(_call_api), timeout=7.0)
             return json.loads(response.text)
         except asyncio.TimeoutError:
-            logger.warning(f"[{self.name}] LLM Timeout (Rate Limit/Slow response). Пропускаем ход.")
-            return {"action": "PASS"}
+            logger.warning(f"[{self.name}] LLM Timeout (Rate Limit/Slow response). Переключение хода на _demo_heuristic_brain.")
+            return self._demo_heuristic_brain(map_core, all_agents)
         except Exception as e:
-            logger.error(f"[{self.name}] LLM Error: {e}")
-            await asyncio.sleep(2) 
-            return {"action": "PASS"}
+            logger.error(f"[{self.name}] LLM Error: {e}. Переключение хода на _demo_heuristic_brain.")
+            return self._demo_heuristic_brain(map_core, all_agents)
 
     def record_action_result(self, action_data: dict, result_msg: str):
         """Регистрирует действие и обновляет научные когнитивные метрики агента."""
@@ -1495,8 +1895,13 @@ async def main_simulation():
         with open("agents_config.json", "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
-        logger.error("agents_config.json не найден!")
-        return
+        try:
+            logger.warning("agents_config.json не найден — используется agents_config.example.json (Zero-Key Demo Mode).")
+            with open("agents_config.example.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            logger.error("Ни agents_config.json, ни agents_config.example.json не найдены!")
+            return
 
     world_map = MapCore(width=7, height=7)
     world_map.spawn_mines()

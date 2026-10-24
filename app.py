@@ -171,8 +171,13 @@ def api_start():
     mode = req.get("mode", "ai_only")
     ablation_no_compass = bool(req.get("ablation_no_compass", False))
     try:
-        with open("agents_config.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
+        try:
+            with open("agents_config.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            logging.warning("agents_config.json не найден — загружается шаблон agents_config.example.json (Zero-Key Demo Mode).")
+            with open("agents_config.example.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
     
